@@ -1,0 +1,18 @@
+# Ignore dependency files
+node_modules/
+npm-debug.log
+
+# Ignore compiled artifacts
+dist/
+build/
+.next/
+
+# Ignore configuration and metadata files
+.env
+.env.local
+.git/
+.github/
+.dockerignore
+README.md
+metadata.json
+components.json
