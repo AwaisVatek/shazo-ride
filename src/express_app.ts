@@ -25,11 +25,37 @@ const app = express();
 
 // 1. Core Security Middlewares
 app.use(helmet());
-app.use(cors({
-  origin: "*", // Adjust origins accordingly in production
-  methods: ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"]
-}));
+const allowedOrigins = [
+  "https://admin.shazoride.com",
+  "https://app.shazoride.com",
+  "http://localhost:5173",
+  "http://localhost:3000",
+];
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      return callback(new Error(`CORS blocked for origin: ${origin}`));
+    },
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "Cache-Control", "Pragma"],
+  })
+);
+
+app.options("*", cors());
+
+app.use("/api", (_req, res, next) => {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+  res.setHeader("Surrogate-Control", "no-store");
+  next();
+});
 
 // Robust body parser limit parameters protects memory slots
 app.use(express.json({ limit: "15mb" }));
