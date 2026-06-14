@@ -11,6 +11,7 @@
     "db:seed": "tsx server.ts --seed",
     "db:migrate:prod": "node dist/server.cjs --migrate",
     "db:seed:prod": "node dist/server.cjs --seed",
+    "migrate": "node dist/server.cjs --migrate",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit"
   },

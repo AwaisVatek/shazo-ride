@@ -186,4 +186,51 @@ router.post("/ambulance/request", async (req: Request, res: Response) => {
   }
 });
 
+// --- WALLET / LEDGER ---
+/**
+ * GET /api/customer/wallet
+ */
+router.get("/wallet", async (req: Request, res: Response) => {
+  const authReq = req as AuthenticatedRequest;
+  try {
+    const transactions = await db.query(
+      "SELECT * FROM ledger_transactions WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50",
+      [authReq.user.userId]
+    );
+    
+    // Calculate current balance
+    const balanceResult = await db.query(
+      "SELECT SUM(amount) as balance FROM ledger_transactions WHERE user_id = $1",
+      [authReq.user.userId]
+    );
+    
+    const balance = balanceResult[0]?.balance || 0;
+    
+    return sendSuccess(res, { balance, transactions });
+  } catch (err: any) {
+    return sendError(res, "FETCH_WALLET_FAILED", err.message);
+  }
+});
+
+/**
+ * POST /api/customer/wallet/topup
+ */
+router.post("/wallet/topup", async (req: Request, res: Response) => {
+  const authReq = req as AuthenticatedRequest;
+  const { amount, payment_method, reference_id } = req.body;
+  if (!amount || amount <= 0) return sendError(res, "INVALID_AMOUNT", "Amount must be greater than zero.");
+  
+  try {
+    const txId = "tx_" + crypto.randomUUID().slice(0, 8);
+    await db.query(
+      `INSERT INTO ledger_transactions (id, user_id, transaction_type, amount, currency, status, reference_id, metadata)
+       VALUES ($1, $2, 'topup', $3, 'PKR', 'completed', $4, $5)`,
+      [txId, authReq.user.userId, amount, reference_id || null, { payment_method }]
+    );
+    return sendSuccess(res, { message: "Wallet topped up successfully.", transaction_id: txId, amount_added: amount });
+  } catch (err: any) {
+    return sendError(res, "TOPUP_FAILED", err.message);
+  }
+});
+
 export default router;
