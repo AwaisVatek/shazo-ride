@@ -31,7 +31,7 @@ const configSchema = z.object({
   OTP_EXPIRY_MINUTES: z.preprocess((val) => Number(val) || 5, z.number().default(5)),
   OTP_MAX_ATTEMPTS: z.preprocess((val) => Number(val) || 5, z.number().default(5)),
   OTP_RESEND_COOLDOWN_SECONDS: z.preprocess((val) => Number(val) || 60, z.number().default(60)),
-  OTP_BYPASS_ENABLED: z.preprocess((val) => val === "true", z.boolean().default(false)),
+  OTP_BYPASS_ENABLED: z.boolean().default(true),
   OTP_TEST_CODE: z.string().default("123456"),
   CUSTOMER_TEST_LOGIN_ENABLED: z.preprocess((val) => val === "true" || val === undefined, z.boolean().default(true)),
   CUSTOMER_TEST_PHONE: z.string().default("923183765294"),
