@@ -23,19 +23,25 @@ const configSchema = z.object({
   DEFAULT_CURRENCY: z.string().default("PKR"),
 
   // OTP Configuration Setup
+  OTP_PROVIDER: z.string().default("whatsapp_evolution"),
   OTP_PRIMARY_CHANNEL: z.enum(["whatsapp", "email", "sms"]).default("whatsapp"),
   OTP_FALLBACK_CHANNEL: z.enum(["whatsapp", "email", "sms"]).default("email"),
   OTP_ENABLE_SMS_FALLBACK: z.preprocess((val) => val === "true", z.boolean().default(false)),
-  OTP_CODE_LENGTH: z.preprocess((val) => Number(val) || 4, z.number().default(4)),
+  OTP_CODE_LENGTH: z.preprocess((val) => Number(val) || 6, z.number().default(6)),
   OTP_EXPIRY_MINUTES: z.preprocess((val) => Number(val) || 5, z.number().default(5)),
   OTP_MAX_ATTEMPTS: z.preprocess((val) => Number(val) || 5, z.number().default(5)),
   OTP_RESEND_COOLDOWN_SECONDS: z.preprocess((val) => Number(val) || 60, z.number().default(60)),
+  OTP_BYPASS_ENABLED: z.preprocess((val) => val === "true", z.boolean().default(false)),
+  OTP_TEST_CODE: z.string().default("123456"),
 
   // Evolution WhatsApp Gateway API
   WHATSAPP_PROVIDER: z.string().default("evolution"),
-  EVOLUTION_API_BASE_URL: z.string().default("https://evo.visioninfinity.co"),
-  EVOLUTION_API_KEY: z.string().default("demo_evolution_key"),
-  EVOLUTION_INSTANCE_NAME: z.string().default("shazo"),
+  EVOLUTION_API_URL: z.string().default("http://evo-kdq65p6ztxy3655q2y1iafko.144.91.76.234.sslip.io"),
+  EVOLUTION_API_KEY: z.string().default("demo_instance_key"),
+  EVOLUTION_GLOBAL_API_KEY: z.string().default("demo_global_key"),
+  EVOLUTION_INSTANCE_ID: z.string().default("demo_instance_id"),
+  EVOLUTION_INSTANCE_NAME: z.string().default("shazo_ride"),
+  EVOLUTION_WEBHOOK_URL: z.string().default("https://app.shazoride.com/api/webhooks/evolution"),
   EVOLUTION_DEFAULT_COUNTRY_CODE: z.string().default("92"),
 
   // Brevo/SMTP Mailer Setup

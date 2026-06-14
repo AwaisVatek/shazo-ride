@@ -8,6 +8,7 @@ import { db } from "./db/index";
 
 // Import Modular Blueprints Rotators
 import authRoutes from "./modules/auth/auth.routes";
+import customerRoutes from "./modules/customer/customer.routes";
 import usersRoutes from "./modules/users/users.routes";
 import mapsRoutes from "./modules/maps/maps.routes";
 import ridesRoutes from "./modules/rides/rides.routes";
@@ -20,6 +21,7 @@ import financeRoutes from "./modules/finance/finance.routes";
 import supportRoutes from "./modules/support/support.routes";
 import dispatchRoutes from "./modules/dispatch/dispatch.routes";
 import notificationsRoutes from "./modules/notifications/notifications.routes";
+import webhooksRoutes from "./modules/webhooks/webhooks.routes";
 
 const app = express();
 
@@ -76,6 +78,7 @@ app.use("/api", apiLimiter);
 
 // 3. Register Modular Route Segments
 app.use("/api/auth", authRoutes);
+app.use("/api/customer", customerRoutes);
 app.use("/api/users", usersRoutes);
 app.use("/api/maps", mapsRoutes);
 app.use("/api/rides", ridesRoutes);
@@ -88,6 +91,7 @@ app.use("/api/finance", financeRoutes);
 app.use("/api/support", supportRoutes);
 app.use("/api/dispatch", dispatchRoutes);
 app.use("/api/notifications", notificationsRoutes);
+app.use("/api/webhooks", webhooksRoutes);
 
 // 4. Custom Verification Testing Endpoints
 app.get("/api/health", (req: Request, res: Response) => {

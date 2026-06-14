@@ -9,8 +9,21 @@ import { sendWhatsApp } from "../../utils/notify";
 const router = Router();
 
 /**
+ * GET /api/rides/types
+ * Returns the list of all active service types for rides
+ */
+router.get("/types", requireAuth, async (req: Request, res: Response) => {
+  try {
+    const types = await db.query("SELECT * FROM service_settings WHERE is_active = true");
+    return sendSuccess(res, { types });
+  } catch (err: any) {
+    return sendError(res, "FETCH_TYPES_FAILED", err.message, 500);
+  }
+});
+
+/**
  * POST /api/rides/estimate
- * Dynamically computes ride prices for bike and car based on database fare rules
+ * Dynamically computes ride prices based on database fare rules
  */
 router.post("/estimate", requireAuth, async (req: Request, res: Response) => {
   const { pickup_lat, pickup_lng, dropoff_lat, dropoff_lng, promo_code } = req.body;
@@ -42,23 +55,11 @@ router.post("/estimate", requireAuth, async (req: Request, res: Response) => {
     const { distance_km, duration_minutes } = distBody.data;
 
     // 2. Fetch service fare configuration rules from SQL
-    const bikeSettings = await db.query("SELECT * FROM service_settings WHERE service_type = 'bike' AND is_active = true");
-    const carSettings = await db.query("SELECT * FROM service_settings WHERE service_type = 'car' AND is_active = true");
+    const activeSettings = await db.query("SELECT * FROM service_settings WHERE is_active = true");
 
-    if (bikeSettings.length === 0 || carSettings.length === 0) {
+    if (activeSettings.length === 0) {
       return sendError(res, "CONFIG_MISSING", "Services configurations are uninitialized in the database settings.");
     }
-
-    const bs = bikeSettings[0];
-    const cs = carSettings[0];
-
-    // Compute Bike fare = base_fare + (distance * per_km) + (duration * per_minute)
-    let bikeBase = Number(bs.base_fare) + (distance_km * Number(bs.per_km_rate)) + (duration_minutes * Number(bs.per_minute_rate));
-    bikeBase = Math.max(bikeBase, Number(bs.minimum_fare));
-
-    // Compute Car fare
-    let carBase = Number(cs.base_fare) + (distance_km * Number(cs.per_km_rate)) + (duration_minutes * Number(cs.per_minute_rate));
-    carBase = Math.max(carBase, Number(cs.minimum_fare));
 
     // 3. Apply promotional discounts if specified
     let discount = 0;
@@ -84,36 +85,25 @@ router.post("/estimate", requireAuth, async (req: Request, res: Response) => {
       return discount > 0 ? Math.min(amount, discount) : 0;
     };
 
-    const bikeDiscount = calcDiscount(bikeBase);
-    const carDiscount = calcDiscount(carBase);
-
-    // Apply Karachi pilot general 0% commission campaigns checks if enabled
-    const commissionCampaigns = await db.query(
-      "SELECT * FROM free_commission_enabled = true" // Handled gracefully inside configuration rules
-    ).catch(() => []);
+    const estimates = activeSettings.map(service => {
+      let baseFare = Number(service.base_fare) + (distance_km * Number(service.per_km_rate)) + (duration_minutes * Number(service.per_minute_rate));
+      baseFare = Math.max(baseFare, Number(service.minimum_fare));
+      const finalFare = Math.max(0, baseFare - calcDiscount(baseFare));
+      
+      return {
+        service_type: service.service_type,
+        service_name: service.service_name || service.service_type,
+        original_fare: Math.round(baseFare),
+        final_fare: Math.round(finalFare),
+        discount_applied: Math.round(calcDiscount(baseFare)),
+        currency: config.DEFAULT_CURRENCY,
+        pilot_commission: config.FREE_COMMISSION_ENABLED ? 0 : Math.round(baseFare * (Number(service.commission_percentage) / 100))
+      };
+    });
 
     return sendSuccess(res, {
       route: { distance_km, duration_minutes },
-      estimates: [
-        {
-          service_type: "bike",
-          service_name: "Shazo Bike",
-          original_fare: Math.round(bikeBase),
-          final_fare: Math.round(bikeBase - bikeDiscount),
-          discount_applied: Math.round(bikeDiscount),
-          currency: config.DEFAULT_CURRENCY,
-          pilot_commission: config.FREE_COMMISSION_ENABLED ? 0 : Math.round(bikeBase * (Number(bs.commission_percentage) / 100))
-        },
-        {
-          service_type: "car",
-          service_name: "Shazo Car",
-          original_fare: Math.round(carBase),
-          final_fare: Math.round(carBase - carDiscount),
-          discount_applied: Math.round(carDiscount),
-          currency: config.DEFAULT_CURRENCY,
-          pilot_commission: config.FREE_COMMISSION_ENABLED ? 0 : Math.round(carBase * (Number(cs.commission_percentage) / 100))
-        }
-      ]
+      estimates: estimates
     });
 
   } catch (err: any) {
@@ -122,10 +112,10 @@ router.post("/estimate", requireAuth, async (req: Request, res: Response) => {
 });
 
 /**
- * POST /api/rides/create
+ * POST /api/rides/book
  * Submits custom ride request to the dispatch network queue
  */
-router.post("/create", requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+router.post("/book", requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   const { pickup_address, pickup_lat, pickup_lng, dropoff_address, dropoff_lat, dropoff_lng, ride_type, payment_method, promo_code, proposed_fare } = req.body;
 
   if (!pickup_address || pickup_lat === undefined || pickup_lng === undefined || !dropoff_address || dropoff_lat === undefined || dropoff_lng === undefined || !ride_type) {
@@ -457,6 +447,21 @@ router.post("/:id/emergency", requireAuth, async (req: AuthenticatedRequest, res
 
   } catch (err: any) {
     return sendError(res, "EMERGENCY_SOS_FAILED", err.message, 500);
+  }
+});
+
+/**
+ * GET /api/rides/:id/status
+ * Check ride status quickly without full payload
+ */
+router.get("/:id/status", requireAuth, async (req: Request, res: Response) => {
+  const rideId = req.params.id;
+  try {
+    const rides = await db.query("SELECT id, status, rider_id FROM ride_bookings WHERE id = $1", [rideId]);
+    if (rides.length === 0) return sendError(res, "NOT_FOUND", "Ride not found");
+    return sendSuccess(res, { status: rides[0].status, rider_id: rides[0].rider_id });
+  } catch (err: any) {
+    return sendError(res, "FETCH_FAILED", err.message, 500);
   }
 });
 

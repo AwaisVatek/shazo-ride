@@ -3,6 +3,7 @@ import crypto from "crypto";
 import { requireAuth, requireAdmin, AuthenticatedRequest } from "../../middleware/auth";
 import { sendSuccess, sendError } from "../../utils/response";
 import { db } from "../../db/index";
+import { evolutionService } from "../../services/evolution-whatsapp.service";
 
 const router = Router();
 
@@ -733,6 +734,40 @@ router.patch("/settings", async (req: AuthenticatedRequest, res: Response) => {
 router.get("/audit", async (req: Request, res: Response) => {
   const logs = await safeRows("audit", "SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 100");
   return sendSuccess(res, { logs });
+});
+
+// --- Integrations & Diagnostics ---
+router.post("/integrations/evolution/configure-webhook", async (req: Request, res: Response) => {
+  try {
+    const result = await evolutionService.configureWebhook();
+    return sendSuccess(res, { message: "Webhook configured successfully", data: result });
+  } catch (error: any) {
+    return sendError(res, "WEBHOOK_CONFIG_FAILED", error.message);
+  }
+});
+
+router.get("/integrations/whatsapp/diagnostics", async (req: Request, res: Response) => {
+  try {
+    const otps = await safeRows("otps", "SELECT id, normalized_phone as phone, role, created_at, expires_at, verified_at, attempts, max_attempts FROM otp_verifications ORDER BY created_at DESC LIMIT 50");
+    const isWhatsAppOnline = await evolutionService.testConnection();
+    
+    // Check recent webhook logs
+    const webhookLogs = await safeRows("webhooks", "SELECT * FROM whatsapp_event_logs ORDER BY created_at DESC LIMIT 10");
+
+    return sendSuccess(res, {
+      diagnostics: {
+        whatsapp_api_online: isWhatsAppOnline,
+        webhook_health: webhookLogs.length > 0 ? "receiving" : "no_recent_events"
+      },
+      recent_otps: otps.map(otp => ({
+        ...otp,
+        status: otp.verified_at ? 'verified' : (new Date(otp.expires_at) < new Date() ? 'expired' : (otp.attempts >= otp.max_attempts ? 'blocked' : 'pending'))
+      })),
+      recent_webhooks: webhookLogs
+    });
+  } catch (error: any) {
+    return sendError(res, "DIAGNOSTICS_FAILED", error.message);
+  }
 });
 
 export default router;

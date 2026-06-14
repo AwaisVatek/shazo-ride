@@ -8,6 +8,7 @@ import { requireAuth, AuthenticatedRequest } from "../../middleware/auth";
 import { sendSuccess, sendError } from "../../utils/response";
 import { normalizePakistanPhone, isValidPakistanPhone } from "../../utils/phone";
 import { sendWhatsApp, sendEmail, sendSMS } from "../../utils/notify";
+import { domainNotifier } from "../../services/notification.service";
 
 const router = Router();
 
@@ -338,6 +339,189 @@ router.post("/logout", requireAuth, async (req: Request, res: Response) => {
 router.get("/session", requireAuth, async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
   return sendSuccess(res, { user: authReq.user });
+});
+
+/**
+ * POST /api/auth/request-otp
+ * Mobile app endpoint for sending OTP to Customers and Riders
+ */
+router.post("/request-otp", async (req: Request, res: Response) => {
+  const { phone, role } = req.body;
+
+  if (!phone || !role || !["customer", "rider"].includes(role)) {
+    return sendError(res, "VALIDATION_FAILED", "Valid phone and role (customer or rider) are required.");
+  }
+
+  const target = normalizePakistanPhone(phone);
+  if (!isValidPakistanPhone(target)) {
+    return sendError(res, "INVALID_PHONE", "Phone number must be a valid Pakistani number.");
+  }
+
+  try {
+    // Check cooldown
+    const existing = await db.query(
+      `SELECT created_at FROM otp_verifications 
+       WHERE normalized_phone = $1 AND role = $2 AND verified_at IS NULL AND created_at > NOW() - INTERVAL '1 second' * $3
+       ORDER BY created_at DESC LIMIT 1`,
+      [target, role, config.OTP_RESEND_COOLDOWN_SECONDS]
+    );
+
+    if (existing.length > 0) {
+      return sendError(res, "COOLDOWN_ACTIVE", `Please wait ${config.OTP_RESEND_COOLDOWN_SECONDS} seconds before requesting a new OTP.`, 429);
+    }
+
+    // Generate OTP
+    let rawPin = config.OTP_TEST_CODE;
+    if (!config.OTP_BYPASS_ENABLED) {
+      rawPin = Math.floor(Math.pow(10, config.OTP_CODE_LENGTH - 1) + Math.random() * 9 * Math.pow(10, config.OTP_CODE_LENGTH - 1)).toString();
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    const pinHash = await bcrypt.hash(rawPin, salt);
+    const expiresAt = new Date(Date.now() + config.OTP_EXPIRY_MINUTES * 60000);
+    const otpId = "vfn_" + crypto.randomUUID().slice(0, 8);
+
+    await db.query(
+      `INSERT INTO otp_verifications (id, phone, normalized_phone, role, otp_hash, max_attempts, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [otpId, phone, target, role, pinHash, config.OTP_MAX_ATTEMPTS, expiresAt]
+    );
+
+    // Send OTP
+    if (!config.OTP_BYPASS_ENABLED) {
+      await domainNotifier.dispatch(target, "otp", { otp: rawPin });
+    } else {
+      console.log(`[OTP_BYPASS] OTP for ${target} is ${rawPin}`);
+    }
+
+    return sendSuccess(res, {
+      message: "OTP sent successfully",
+      expiresInMinutes: config.OTP_EXPIRY_MINUTES,
+      bypass: config.OTP_BYPASS_ENABLED
+    });
+
+  } catch (err: any) {
+    return sendError(res, "OTP_FAILED", err.message, 500);
+  }
+});
+
+/**
+ * POST /api/auth/verify-otp
+ * Mobile app endpoint for verifying OTP and generating JWT
+ */
+router.post("/verify-otp", async (req: Request, res: Response) => {
+  const { phone, otp, role } = req.body;
+
+  if (!phone || !otp || !role || !["customer", "rider"].includes(role)) {
+    return sendError(res, "VALIDATION_FAILED", "Phone, otp, and valid role are required.");
+  }
+
+  const target = normalizePakistanPhone(phone);
+
+  try {
+    const records = await db.query(
+      `SELECT * FROM otp_verifications 
+       WHERE normalized_phone = $1 AND role = $2 AND verified_at IS NULL AND expires_at > NOW()
+       ORDER BY created_at DESC LIMIT 1`,
+      [target, role]
+    );
+
+    if (records.length === 0) {
+      return sendError(res, "OTP_NOT_FOUND", "No active OTP found or OTP has expired.");
+    }
+
+    const matchedOtp = records[0];
+
+    if (matchedOtp.attempts >= matchedOtp.max_attempts) {
+      return sendError(res, "BLOCKED_ATTEMPTS", "Maximum attempts exceeded. Request a new OTP.", 403);
+    }
+
+    const isValid = await bcrypt.compare(otp.toString(), matchedOtp.otp_hash);
+
+    if (!isValid) {
+      await db.query("UPDATE otp_verifications SET attempts = attempts + 1, updated_at = NOW() WHERE id = $1", [matchedOtp.id]);
+      return sendError(res, "WRONG_CODE", "The OTP provided is incorrect.", 400);
+    }
+
+    await db.query("UPDATE otp_verifications SET verified_at = NOW(), updated_at = NOW() WHERE id = $1", [matchedOtp.id]);
+
+    // Handle Lazy Registration
+    let userRows = await db.query("SELECT * FROM users WHERE phone = $1 AND role = $2", [target, role]);
+    let activeUser;
+    let isNewUser = false;
+
+    if (userRows.length === 0) {
+      isNewUser = true;
+      const newId = "usr_" + crypto.randomUUID().slice(0, 8);
+      const parsedName = `${role === 'customer' ? 'Customer' : 'Rider'} ${target.slice(-4)}`;
+
+      await db.query(
+        `INSERT INTO users (id, full_name, phone, role, is_verified, avatar_url)
+         VALUES ($1, $2, $3, $4, true, $5)`,
+        [newId, parsedName, target, role, `https://api.dicebear.com/7.x/initials/svg?seed=${parsedName}`]
+      );
+
+      await db.query(
+        `INSERT INTO auth_accounts (id, user_id, provider, provider_user_id)
+         VALUES ($1, $2, 'phone_otp', $3)`,
+        ["auth_" + crypto.randomUUID().slice(0, 8), newId, target]
+      );
+
+      if (role === "customer") {
+        await db.query("INSERT INTO customer_profiles (user_id) VALUES ($1)", [newId]);
+      } else if (role === "rider") {
+        await db.query("INSERT INTO rider_profiles (user_id) VALUES ($1)", [newId]);
+        await db.query("INSERT INTO rider_wallets (rider_id, balance) VALUES ($1, 0)", [newId]);
+      }
+
+      const freshlyCreated = await db.query("SELECT * FROM users WHERE id = $1", [newId]);
+      activeUser = freshlyCreated[0];
+    } else {
+      activeUser = userRows[0];
+    }
+
+    const token = jwt.sign(
+      { userId: activeUser.id, role: activeUser.role },
+      config.JWT_SECRET,
+      { expiresIn: "30d" }
+    );
+
+    const sessionId = "ses_" + crypto.randomUUID().slice(0, 8);
+    await db.query(
+      `INSERT INTO sessions (id, user_id, role, token, expires_at)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [sessionId, activeUser.id, activeUser.role, token, new Date(Date.now() + 30 * 24 * 3600000)]
+    );
+
+    return sendSuccess(res, {
+      token,
+      user: {
+        id: activeUser.id,
+        phone: activeUser.phone,
+        role: activeUser.role,
+        profile_completed: activeUser.profile_completed || false,
+        isNewUser
+      }
+    });
+
+  } catch (err: any) {
+    return sendError(res, "VERIFICATION_ERROR", err.message, 500);
+  }
+});
+
+/**
+ * GET /api/auth/me
+ * Mobile app endpoint to get authenticated user session
+ */
+router.get("/me", requireAuth, async (req: Request, res: Response) => {
+  const authReq = req as AuthenticatedRequest;
+  const userRows = await db.query("SELECT id, full_name, phone, role, profile_completed, avatar_url FROM users WHERE id = $1", [authReq.user.userId]);
+  
+  if (userRows.length === 0) {
+    return sendError(res, "USER_NOT_FOUND", "Authenticated user not found.", 404);
+  }
+
+  return sendSuccess(res, { user: userRows[0] });
 });
 
 export default router;
