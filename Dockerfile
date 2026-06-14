@@ -1,7 +1,7 @@
 FROM node:20-alpine AS builder
 WORKDIR /usr/src/app
 COPY package*.json ./
-RUN npm ci
+RUN npm ci --include=dev
 COPY . .
 RUN npm run build
 
