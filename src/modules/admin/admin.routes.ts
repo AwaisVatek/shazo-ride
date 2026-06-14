@@ -221,11 +221,92 @@ router.get("/restaurants/:id/menu", async (req: AuthenticatedRequest, res: Respo
 });
 
 router.patch("/restaurants/menu/:itemId", async (req: AuthenticatedRequest, res: Response) => {
-  const isAvailable = req.body?.isAvailable;
-  if (isAvailable !== undefined) {
-    await safeRows("update menu item", "UPDATE restaurant_menu_items SET is_available = $1, updated_at = NOW() WHERE id = $2", [isAvailable, req.params.itemId]);
-  }
+  const { name, description, price, isAvailable, categoryId, imageUrl } = req.body;
+  
+  await safeRows("update menu item", `
+    UPDATE restaurant_menu_items 
+    SET 
+      name = COALESCE($1, name),
+      description = COALESCE($2, description),
+      price = COALESCE($3, price),
+      is_available = COALESCE($4, is_available),
+      category_id = COALESCE($5, category_id),
+      image_url = COALESCE($6, image_url),
+      updated_at = NOW() 
+    WHERE id = $7
+  `, [
+    name || null, 
+    description || null, 
+    price !== undefined ? Number(price) : null, 
+    isAvailable !== undefined ? Boolean(isAvailable) : null,
+    categoryId || null,
+    imageUrl || null,
+    req.params.itemId
+  ]);
+  
   return sendSuccess(res, okMessage("Menu item updated"));
+});
+
+router.get("/restaurants/:id/menu/categories", async (req: AuthenticatedRequest, res: Response) => {
+  const cats = await safeRows("categories", "SELECT id, name FROM restaurant_categories WHERE restaurant_id = $1 ORDER BY sort_order", [req.params.id]);
+  return sendSuccess(res, cats);
+});
+
+router.post("/restaurants/:id/menu/category", async (req: AuthenticatedRequest, res: Response) => {
+  const { name, description, sortOrder } = req.body;
+  const catId = `cat_${crypto.randomUUID().slice(0, 8)}`;
+  await safeRows("create category", `
+    INSERT INTO restaurant_categories (id, restaurant_id, name, description, sort_order)
+    VALUES ($1, $2, $3, $4, $5)
+  `, [catId, req.params.id, name, description || null, Number(sortOrder || 0)]);
+  return sendSuccess(res, okMessage("Category created", { id: catId }));
+});
+
+router.patch("/restaurants/menu/category/:categoryId", async (req: AuthenticatedRequest, res: Response) => {
+  const { name, description, sortOrder, isActive } = req.body;
+  await safeRows("update category", `
+    UPDATE restaurant_categories
+    SET 
+      name = COALESCE($1, name),
+      description = COALESCE($2, description),
+      sort_order = COALESCE($3, sort_order),
+      is_active = COALESCE($4, is_active),
+      updated_at = NOW()
+    WHERE id = $5
+  `, [
+    name || null, 
+    description || null, 
+    sortOrder !== undefined ? Number(sortOrder) : null, 
+    isActive !== undefined ? Boolean(isActive) : null,
+    req.params.categoryId
+  ]);
+  return sendSuccess(res, okMessage("Category updated"));
+});
+
+router.post("/restaurants/:id/menu/dish", async (req: AuthenticatedRequest, res: Response) => {
+  const { categoryId, name, description, price, imageUrl, isAvailable } = req.body;
+  if (!categoryId || !name) {
+    return sendError(res, "VALIDATION_FAILED", "Category ID and Name are required");
+  }
+  const dishId = `item_${crypto.randomUUID().slice(0, 8)}`;
+  await safeRows("create dish", `
+    INSERT INTO restaurant_menu_items (id, category_id, name, description, price, image_url, is_available)
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
+  `, [
+    dishId, 
+    categoryId, 
+    name, 
+    description || null, 
+    Number(price || 0), 
+    imageUrl || null, 
+    isAvailable !== undefined ? Boolean(isAvailable) : true
+  ]);
+  return sendSuccess(res, okMessage("Dish created", { id: dishId }));
+});
+
+router.delete("/restaurants/menu/:itemId", async (req: AuthenticatedRequest, res: Response) => {
+  await safeRows("delete dish", "DELETE FROM restaurant_menu_items WHERE id = $1", [req.params.itemId]);
+  return sendSuccess(res, okMessage("Dish deleted"));
 });
 
 router.get("/rides", async (req: AuthenticatedRequest, res: Response) => {
