@@ -397,50 +397,58 @@ router.post("/request-otp", async (req: Request, res: Response) => {
 
     // Send OTP
     if (!config.OTP_BYPASS_ENABLED) {
-      // Always prefer n8n webhook if URL is defined, regardless of OTP_PROVIDER env var
       if (config.N8N_OTP_WEBHOOK_URL) {
         try {
           console.log(`[OTP_DISPATCH] Webhook URL: ${config.N8N_OTP_WEBHOOK_URL}`);
           console.log(`[OTP_DISPATCH] Target Phone: ${target}`);
 
-          const response = await fetch(config.N8N_OTP_WEBHOOK_URL, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "x-shazo-webhook-secret": config.N8N_OTP_WEBHOOK_SECRET || ""
-            },
-            body: JSON.stringify({ 
-              event: "otp.requested",
-              request_id: otpId,
-              phone: target, 
-              normalized_phone: target,
-              otp: rawPin, 
-              role,
-              purpose: "login",
-              message: `Your Shazo Ride verification code is ${rawPin}. This code will expire in ${config.OTP_EXPIRY_MINUTES} minutes. Do not share it with anyone.`,
-              expires_in_minutes: config.OTP_EXPIRY_MINUTES,
-              created_at: new Date().toISOString()
-            })
+          const postData = JSON.stringify({ 
+            event: "otp.requested",
+            request_id: otpId,
+            phone: target, 
+            normalized_phone: target,
+            otp: rawPin, 
+            role,
+            purpose: "login",
+            message: `Your Shazo Ride verification code is ${rawPin}. This code will expire in ${config.OTP_EXPIRY_MINUTES} minutes. Do not share it with anyone.`,
+            expires_in_minutes: config.OTP_EXPIRY_MINUTES,
+            created_at: new Date().toISOString()
           });
 
-          console.log(`[OTP_DISPATCH] Webhook HTTP Status: ${response.status}`);
-          
-          let responseBody;
-          try {
-            responseBody = await response.json();
-            console.log(`[OTP_DISPATCH] Webhook Response:`, JSON.stringify(responseBody));
-          } catch (e) {
-            responseBody = await response.text();
-            console.log(`[OTP_DISPATCH] Webhook Text Response:`, responseBody);
-          }
+          const urlObj = new URL(config.N8N_OTP_WEBHOOK_URL);
+          const options = {
+            hostname: urlObj.hostname,
+            port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
+            path: urlObj.pathname + urlObj.search,
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Content-Length': Buffer.byteLength(postData),
+              'x-shazo-webhook-secret': config.N8N_OTP_WEBHOOK_SECRET || ""
+            }
+          };
 
-          if (!response.ok || responseBody?.ok === false) {
-            console.error("[N8N_WEBHOOK_ERROR] Failed with status:", response.status, "Body:", responseBody);
-            return sendError(res, "OTP_DISPATCH_FAILED", "OTP could not be sent via n8n webhook.", 500);
-          }
+          const webhookResult = await new Promise((resolve, reject) => {
+            const req = require('https').request(options, (res: any) => {
+              let body = '';
+              res.on('data', (chunk: any) => body += chunk);
+              res.on('end', () => {
+                if (res.statusCode >= 200 && res.statusCode < 300) {
+                  resolve(body);
+                } else {
+                  reject(new Error(`Webhook returned status ${res.statusCode}: ${body}`));
+                }
+              });
+            });
+            req.on('error', (e: any) => reject(e));
+            req.write(postData);
+            req.end();
+          });
+          
+          console.log("[OTP_DISPATCH] Webhook SUCCESS:", webhookResult);
         } catch (e: any) {
           console.error("[N8N_WEBHOOK_ERROR]", e.message);
-          return sendError(res, "OTP_DISPATCH_FAILED", "OTP could not be sent. Please try again.", 500);
+          return sendError(res, "OTP_DISPATCH_FAILED", `OTP Webhook Error: ${e.message}`, 500);
         }
       } else {
         const dispatched = await domainNotifier.dispatch(target, "otp", { otp: rawPin });
@@ -646,44 +654,53 @@ router.post("/signup-password", async (req: Request, res: Response) => {
           console.log(`[OTP_DISPATCH_SIGNUP] Webhook URL: ${config.N8N_OTP_WEBHOOK_URL}`);
           console.log(`[OTP_DISPATCH_SIGNUP] Target Phone: ${target}`);
 
-          const response = await fetch(config.N8N_OTP_WEBHOOK_URL, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "x-shazo-webhook-secret": config.N8N_OTP_WEBHOOK_SECRET || ""
-            },
-            body: JSON.stringify({ 
-              event: "otp.requested",
-              request_id: otpId,
-              phone: target, 
-              normalized_phone: target,
-              otp: rawPin, 
-              role: "customer",
-              purpose: "signup",
-              message: `Your Shazo Ride verification code is ${rawPin}. This code will expire in ${config.OTP_EXPIRY_MINUTES} minutes. Do not share it with anyone.`,
-              expires_in_minutes: config.OTP_EXPIRY_MINUTES,
-              created_at: new Date().toISOString()
-            })
+          const postData = JSON.stringify({ 
+            event: "otp.requested",
+            request_id: otpId,
+            phone: target, 
+            normalized_phone: target,
+            otp: rawPin, 
+            role: "customer",
+            purpose: "signup",
+            message: `Your Shazo Ride verification code is ${rawPin}. This code will expire in ${config.OTP_EXPIRY_MINUTES} minutes. Do not share it with anyone.`,
+            expires_in_minutes: config.OTP_EXPIRY_MINUTES,
+            created_at: new Date().toISOString()
           });
 
-          console.log(`[OTP_DISPATCH_SIGNUP] Webhook HTTP Status: ${response.status}`);
-          
-          let responseBody;
-          try {
-            responseBody = await response.json();
-            console.log(`[OTP_DISPATCH_SIGNUP] Webhook Response:`, JSON.stringify(responseBody));
-          } catch (e) {
-            responseBody = await response.text();
-            console.log(`[OTP_DISPATCH_SIGNUP] Webhook Text Response:`, responseBody);
-          }
+          const urlObj = new URL(config.N8N_OTP_WEBHOOK_URL);
+          const options = {
+            hostname: urlObj.hostname,
+            port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
+            path: urlObj.pathname + urlObj.search,
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Content-Length': Buffer.byteLength(postData),
+              'x-shazo-webhook-secret': config.N8N_OTP_WEBHOOK_SECRET || ""
+            }
+          };
 
-          if (!response.ok || responseBody?.ok === false) {
-            console.error("[N8N_WEBHOOK_ERROR] Signup OTP Failed with status:", response.status, "Body:", responseBody);
-            return sendError(res, "OTP_DISPATCH_FAILED", "OTP could not be sent via webhook.", 500);
-          }
+          const webhookResult = await new Promise((resolve, reject) => {
+            const req = require('https').request(options, (res: any) => {
+              let body = '';
+              res.on('data', (chunk: any) => body += chunk);
+              res.on('end', () => {
+                if (res.statusCode >= 200 && res.statusCode < 300) {
+                  resolve(body);
+                } else {
+                  reject(new Error(`Webhook returned status ${res.statusCode}: ${body}`));
+                }
+              });
+            });
+            req.on('error', (e: any) => reject(e));
+            req.write(postData);
+            req.end();
+          });
+          
+          console.log("[OTP_DISPATCH_SIGNUP] Webhook SUCCESS:", webhookResult);
         } catch (e: any) {
           console.error("[N8N_WEBHOOK_ERROR]", e.message);
-          return sendError(res, "OTP_DISPATCH_FAILED", "OTP could not be sent. Please try again.", 500);
+          return sendError(res, "OTP_DISPATCH_FAILED", `OTP Webhook Error: ${e.message}`, 500);
         }
       } else {
         const dispatched = await domainNotifier.dispatch(target, "otp", { otp: rawPin });
