@@ -46,17 +46,17 @@ router.get("/dashboard", async (req: AuthenticatedRequest, res: Response) => {
   const restaurants = await safeCount("restaurants", "SELECT COUNT(*)::int AS count FROM restaurant_profiles");
   const activeRestaurants = await safeCount("active restaurants", "SELECT COUNT(*)::int AS count FROM restaurant_profiles WHERE is_active = true");
   const pendingRestaurantVerifications = await safeCount("pending restaurants", "SELECT COUNT(*)::int AS count FROM restaurant_profiles WHERE COALESCE(is_active, false) = false");
-  const todayBikeRides = await safeCount("today bike rides", "SELECT COUNT(*)::int AS count FROM ride_bookings WHERE ride_type = 'bike' AND created_at::date = CURRENT_DATE");
-  const todayCarRides = await safeCount("today car rides", "SELECT COUNT(*)::int AS count FROM ride_bookings WHERE ride_type = 'car' AND created_at::date = CURRENT_DATE");
+  const todayBikeRides = await safeCount("today bike rides", "SELECT COUNT(*)::int AS count FROM ride_bookings WHERE service_type = 'bike' AND created_at::date = CURRENT_DATE");
+  const todayCarRides = await safeCount("today car rides", "SELECT COUNT(*)::int AS count FROM ride_bookings WHERE service_type = 'car' AND created_at::date = CURRENT_DATE");
   const todayAmbulanceBookings = await safeCount("today ambulance bookings", "SELECT COUNT(*)::int AS count FROM ambulance_bookings WHERE created_at::date = CURRENT_DATE");
   const todayFoodOrders = await safeCount("today food orders", "SELECT COUNT(*)::int AS count FROM food_orders WHERE created_at::date = CURRENT_DATE");
-  const todayRevenue = await safeValue("today revenue", "SELECT COALESCE(SUM(fare), 0)::numeric AS value FROM ride_bookings WHERE created_at::date = CURRENT_DATE");
-  const todayFoodRevenue = await safeValue("today food revenue", "SELECT COALESCE(SUM(grand_total), 0)::numeric AS value FROM food_orders WHERE created_at::date = CURRENT_DATE");
-  const cashCollectedToday = await safeValue("cash today", "SELECT COALESCE(SUM(fare), 0)::numeric AS value FROM ride_bookings WHERE payment_method = 'cash' AND created_at::date = CURRENT_DATE");
+  const todayRevenue = await safeValue("today revenue", "SELECT COALESCE(SUM(total_fare), 0)::numeric AS value FROM ride_bookings WHERE created_at::date = CURRENT_DATE");
+  const todayFoodRevenue = await safeValue("today food revenue", "SELECT COALESCE(SUM(total_amount), 0)::numeric AS value FROM food_orders WHERE created_at::date = CURRENT_DATE");
+  const cashCollectedToday = await safeValue("cash today", "SELECT COALESCE(SUM(amount), 0)::numeric AS value FROM cash_collections WHERE created_at::date = CURRENT_DATE");
   const pendingWalletTopups = await safeCount("pending topups", "SELECT COUNT(*)::int AS count FROM manual_topup_requests WHERE status = 'pending'");
   const supportTicketsOpen = await safeCount("open tickets", "SELECT COUNT(*)::int AS count FROM support_tickets WHERE status IN ('open', 'assigned', 'waiting_user')");
   const commissionToday = await safeValue("commission today", "SELECT COALESCE(SUM(commission_amount), 0)::numeric AS value FROM ride_bookings WHERE created_at::date = CURRENT_DATE");
-  const freeQuota = await safeRows<{ quota_total: number | string; quota_used: number | string }>("free quota", "SELECT COALESCE(SUM(quota_total),0)::int AS quota_total, COALESCE(SUM(quota_used),0)::int AS quota_used FROM free_ride_campaigns WHERE status = 'active'");
+  const freeQuota = await safeRows<{ quota_total: number | string; quota_used: number | string }>("free quota", "SELECT COALESCE(SUM(total_quota),0)::int AS quota_total, COALESCE(SUM(total_used),0)::int AS quota_used FROM free_ride_campaigns WHERE is_active = true");
 
   const totals = {
     customers,
@@ -90,14 +90,25 @@ router.get("/dashboard", async (req: AuthenticatedRequest, res: Response) => {
 
 router.get("/customers", async (req: AuthenticatedRequest, res: Response) => {
   const items = await safeRows("customers", `
-    SELECT u.id, u.full_name, u.email, u.phone, u.role, u.is_verified, u.created_at,
-           cp.rating, cp.completed_rides_count
+    SELECT
+      u.id,
+      u.full_name,
+      u.full_name AS name,
+      u.email,
+      u.phone,
+      u.role,
+      u.is_verified,
+      CASE WHEN u.is_verified = true THEN 'active' ELSE 'pending' END AS status,
+      5 AS rating,
+      0 AS completed_rides_count,
+      u.created_at,
+      u.updated_at
     FROM users u
-    LEFT JOIN customer_profiles cp ON cp.user_id = u.id
     WHERE u.role = 'customer'
     ORDER BY u.created_at DESC
     LIMIT 100
   `);
+
   return sendSuccess(res, listResponse(items));
 });
 
@@ -109,16 +120,43 @@ router.patch("/customers/:id", async (req: AuthenticatedRequest, res: Response) 
 
 router.get("/riders", async (req: AuthenticatedRequest, res: Response) => {
   const items = await safeRows("riders", `
-    SELECT u.id, u.full_name, u.email, u.phone, u.role, u.is_verified, u.created_at,
-           rp.verification_status, rp.vehicle_type, rp.is_online, rp.latitude, rp.longitude, rp.last_location_update,
-           rw.balance
+    SELECT
+      u.id,
+      u.full_name,
+      u.full_name AS name,
+      u.email,
+      u.phone,
+      u.role,
+      u.is_verified,
+      u.created_at,
+
+      rp.id AS rider_profile_id,
+      rp.verification_status,
+      rp.vehicle_type,
+      rp.vehicle_make,
+      rp.vehicle_model,
+      rp.vehicle_plate,
+      rp.vehicle_number,
+      rp.is_online,
+      rp.current_lat,
+      rp.current_lat AS latitude,
+      rp.current_lng,
+      rp.current_lng AS longitude,
+      rp.last_location_at,
+      rp.last_location_at AS last_location_update,
+      rp.rating,
+      rp.total_rides,
+
+      COALESCE(rw.balance, 0) AS balance,
+      COALESCE(rw.balance, 0) AS wallet_balance
     FROM users u
     LEFT JOIN rider_profiles rp ON rp.user_id = u.id
-    LEFT JOIN rider_wallets rw ON rw.rider_id = u.id
+    LEFT JOIN rider_wallets rw ON rw.rider_id = rp.id
     WHERE u.role = 'rider'
     ORDER BY u.created_at DESC
     LIMIT 100
   `);
+
   return sendSuccess(res, listResponse(items));
 });
 
@@ -204,13 +242,35 @@ router.post("/finance/rider-wallets/:riderId/adjust", async (req: AuthenticatedR
 });
 
 router.get("/finance/wallet-ledger", async (req: AuthenticatedRequest, res: Response) => {
-  const items = await safeRows("wallet ledger", "SELECT * FROM rider_wallet_ledger ORDER BY created_at DESC LIMIT 100");
+  const items = await safeRows("wallet ledger", `
+    SELECT
+      wl.*,
+      u.full_name AS rider_name,
+      u.phone AS rider_phone
+    FROM wallet_ledger wl
+    LEFT JOIN rider_profiles rp ON rp.id = wl.rider_id
+    LEFT JOIN users u ON u.id = rp.user_id
+    ORDER BY wl.created_at DESC
+    LIMIT 100
+  `);
+
   return sendSuccess(res, listResponse(items));
 });
 
 router.get("/finance/cash-collections", async (req: AuthenticatedRequest, res: Response) => {
-  const rideCash = await safeRows("ride cash", "SELECT id, customer_id, rider_id, fare AS amount, payment_method, status, created_at FROM ride_bookings WHERE payment_method = 'cash' ORDER BY created_at DESC LIMIT 100");
-  return sendSuccess(res, listResponse(rideCash));
+  const items = await safeRows("cash collections", `
+    SELECT
+      cc.*,
+      u.full_name AS rider_name,
+      u.phone AS rider_phone
+    FROM cash_collections cc
+    LEFT JOIN rider_profiles rp ON rp.id = cc.rider_id
+    LEFT JOIN users u ON u.id = rp.user_id
+    ORDER BY cc.created_at DESC
+    LIMIT 100
+  `);
+
+  return sendSuccess(res, listResponse(items));
 });
 
 router.get("/finance/commission-report", async (req: AuthenticatedRequest, res: Response) => {
@@ -235,13 +295,26 @@ router.patch("/settings/manual-payment-accounts/:id", async (req: AuthenticatedR
 });
 
 router.get("/settings/fares", async (req: AuthenticatedRequest, res: Response) => {
-  const rows = await safeRows<any>("fares", "SELECT * FROM service_settings");
-  const data: Record<string, any> = { bike: {}, car: {}, ambulance: {}, food_delivery: {} };
-  for (const row of rows) {
-    const key = row.service_type === "food" ? "food_delivery" : row.service_type;
-    if (key && Object.prototype.hasOwnProperty.call(data, key)) data[key] = row;
-  }
-  return sendSuccess(res, data);
+  const items = await safeRows<any>("fares", `
+    SELECT
+      id,
+      service_type,
+      service_type AS name,
+      base_fare,
+      per_km_rate,
+      per_minute_rate,
+      minimum_fare,
+      commission_percentage,
+      commission_fixed,
+      is_active,
+      settings,
+      created_at,
+      updated_at
+    FROM service_settings
+    ORDER BY service_type ASC
+  `);
+
+  return sendSuccess(res, listResponse(items));
 });
 
 router.post("/settings/fares", async (req: AuthenticatedRequest, res: Response) => {
@@ -249,13 +322,23 @@ router.post("/settings/fares", async (req: AuthenticatedRequest, res: Response) 
 });
 
 router.get("/settings/commissions", async (req: AuthenticatedRequest, res: Response) => {
-  const rows = await safeRows<any>("commissions", "SELECT * FROM service_settings");
-  const data: Record<string, any> = { bike: {}, car: {}, ambulance: {}, food_delivery: {}, restaurant: {} };
-  for (const row of rows) {
-    const key = row.service_type === "food" ? "food_delivery" : row.service_type;
-    if (key && Object.prototype.hasOwnProperty.call(data, key)) data[key] = row;
-  }
-  return sendSuccess(res, data);
+  const items = await safeRows<any>("commissions", `
+    SELECT
+      id,
+      service_type,
+      service_type AS name,
+      commission_percentage,
+      commission_fixed,
+      base_fare,
+      minimum_fare,
+      is_active,
+      created_at,
+      updated_at
+    FROM service_settings
+    ORDER BY service_type ASC
+  `);
+
+  return sendSuccess(res, listResponse(items));
 });
 
 router.post("/settings/commissions", async (req: AuthenticatedRequest, res: Response) => {
@@ -292,18 +375,86 @@ router.patch("/promo-campaigns/:id", async (req: AuthenticatedRequest, res: Resp
 });
 
 router.get(["/settings/zones", "/zones"], async (req: AuthenticatedRequest, res: Response) => {
-  const items = await safeRows("zones", "SELECT * FROM city_zones ORDER BY name ASC LIMIT 100");
+  const items = await safeRows("zones", `
+    SELECT
+      id,
+      name,
+      city,
+      city AS region,
+      service_type,
+      is_active,
+      surge_multiplier,
+      polygon,
+      center_lat,
+      center_lng,
+      created_at,
+      updated_at
+    FROM service_zones
+    ORDER BY city ASC, name ASC
+    LIMIT 100
+  `);
+
   return sendSuccess(res, listResponse(items));
 });
 
 router.patch("/zones/:id", async (req: AuthenticatedRequest, res: Response) => {
   const status = String(req.body?.status || "active");
-  await safeRows("update zone", "UPDATE city_zones SET is_active = $1 WHERE id = $2", [status !== "inactive" && status !== "disabled", req.params.id]);
+
+  await safeRows(
+    "update zone",
+    "UPDATE service_zones SET is_active = $1, updated_at = NOW() WHERE id = $2",
+    [status !== "inactive" && status !== "disabled", req.params.id]
+  );
+
   return sendSuccess(res, okMessage("Zone updated."));
 });
 
 router.patch("/zones/:id/surge", async (req: AuthenticatedRequest, res: Response) => {
   return sendSuccess(res, okMessage("Surge demand noted.", { zone_id: req.params.id, demand_index: req.body?.demandIndex || 0 }));
+});
+
+router.get(["/dispatch/live", "/dispatch"], async (req: AuthenticatedRequest, res: Response) => {
+  const items = await safeRows("dispatch live", `
+    SELECT
+      da.id,
+      da.booking_type,
+      da.booking_id,
+      da.rider_id,
+      da.status,
+      da.notes,
+      da.assigned_at,
+      da.accepted_at,
+      da.created_at,
+      da.updated_at,
+
+      COALESCE(rb.pickup_address, ab.pickup_address, fo.delivery_address) AS pickup_address,
+      COALESCE(rb.dropoff_address, ab.hospital_address, fo.delivery_address) AS dropoff_address,
+      COALESCE(rb.pickup_lat, ab.pickup_lat, fo.delivery_lat) AS pickup_lat,
+      COALESCE(rb.pickup_lng, ab.pickup_lng, fo.delivery_lng) AS pickup_lng,
+
+      COALESCE(rb.status, ab.status, fo.status) AS booking_status,
+      COALESCE(rb.service_type, ab.emergency_type, 'food') AS service_type,
+      COALESCE(rb.total_fare, ab.total_fare, fo.total_amount, 0) AS total_fare,
+
+      u.full_name AS rider_name,
+      u.phone AS rider_phone
+    FROM dispatch_assignments da
+    LEFT JOIN ride_bookings rb
+      ON da.booking_type = 'ride'
+      AND da.booking_id = rb.id
+    LEFT JOIN ambulance_bookings ab
+      ON da.booking_type = 'ambulance'
+      AND da.booking_id = ab.id
+    LEFT JOIN food_orders fo
+      ON da.booking_type = 'food'
+      AND da.booking_id = fo.id
+    LEFT JOIN users u
+      ON u.id = da.rider_id
+    ORDER BY da.created_at DESC
+    LIMIT 100
+  `);
+
+  return sendSuccess(res, listResponse(items));
 });
 
 router.get("/support/tickets", async (req: AuthenticatedRequest, res: Response) => {
