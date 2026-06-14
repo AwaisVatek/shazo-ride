@@ -372,7 +372,15 @@ router.post("/request-otp", async (req: Request, res: Response) => {
 
     // Generate OTP
     let rawPin = config.OTP_TEST_CODE;
-    if (!config.OTP_BYPASS_ENABLED) {
+    
+    let isTestCustomer = false;
+    if (config.CUSTOMER_TEST_LOGIN_ENABLED && target === normalizePakistanPhone(config.CUSTOMER_TEST_PHONE || "923183765294")) {
+      isTestCustomer = true;
+    }
+
+    if (isTestCustomer) {
+      rawPin = config.CUSTOMER_TEST_OTP || "123456";
+    } else if (!config.OTP_BYPASS_ENABLED) {
       rawPin = Math.floor(Math.pow(10, config.OTP_CODE_LENGTH - 1) + Math.random() * 9 * Math.pow(10, config.OTP_CODE_LENGTH - 1)).toString();
     }
 
@@ -388,8 +396,58 @@ router.post("/request-otp", async (req: Request, res: Response) => {
     );
 
     // Send OTP
-    if (!config.OTP_BYPASS_ENABLED) {
-      await domainNotifier.dispatch(target, "otp", { otp: rawPin });
+    if (!config.OTP_BYPASS_ENABLED && !isTestCustomer) {
+      if (config.OTP_PROVIDER === "n8n_webhook" && config.N8N_OTP_WEBHOOK_URL) {
+        try {
+          console.log(`[OTP_DISPATCH] Provider: ${config.OTP_PROVIDER}`);
+          console.log(`[OTP_DISPATCH] Webhook URL: ${config.N8N_OTP_WEBHOOK_URL}`);
+          console.log(`[OTP_DISPATCH] Target Phone: ${target}`);
+
+          const response = await fetch(config.N8N_OTP_WEBHOOK_URL, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-shazo-webhook-secret": config.N8N_OTP_WEBHOOK_SECRET || ""
+            },
+            body: JSON.stringify({ 
+              event: "otp.requested",
+              request_id: otpId,
+              phone: target, 
+              normalized_phone: target,
+              otp: rawPin, 
+              role,
+              purpose: "login",
+              message: `Your Shazo Ride verification code is ${rawPin}. This code will expire in ${config.OTP_EXPIRY_MINUTES} minutes. Do not share it with anyone.`,
+              expires_in_minutes: config.OTP_EXPIRY_MINUTES,
+              created_at: new Date().toISOString()
+            })
+          });
+
+          console.log(`[OTP_DISPATCH] Webhook HTTP Status: ${response.status}`);
+          
+          let responseBody;
+          try {
+            responseBody = await response.json();
+            console.log(`[OTP_DISPATCH] Webhook Response:`, JSON.stringify(responseBody));
+          } catch (e) {
+            responseBody = await response.text();
+            console.log(`[OTP_DISPATCH] Webhook Text Response:`, responseBody);
+          }
+
+          if (!response.ok || responseBody?.ok === false) {
+            console.error("[N8N_WEBHOOK_ERROR] Failed with status:", response.status, "Body:", responseBody);
+            return sendError(res, "OTP_DISPATCH_FAILED", "OTP could not be sent via n8n webhook.", 500);
+          }
+        } catch (e: any) {
+          console.error("[N8N_WEBHOOK_ERROR]", e.message);
+          return sendError(res, "OTP_DISPATCH_FAILED", "OTP could not be sent. Please try again.", 500);
+        }
+      } else {
+        const dispatched = await domainNotifier.dispatch(target, "otp", { otp: rawPin });
+        if (!dispatched) {
+          return sendError(res, "OTP_DISPATCH_FAILED", "OTP could not be sent on WhatsApp. Please try again.", 500);
+        }
+      }
     } else {
       console.log(`[OTP_BYPASS] OTP for ${target} is ${rawPin}`);
     }
@@ -456,9 +514,9 @@ router.post("/verify-otp", async (req: Request, res: Response) => {
       const parsedName = `${role === 'customer' ? 'Customer' : 'Rider'} ${target.slice(-4)}`;
 
       await db.query(
-        `INSERT INTO users (id, full_name, phone, role, is_verified, avatar_url)
-         VALUES ($1, $2, $3, $4, true, $5)`,
-        [newId, parsedName, target, role, `https://api.dicebear.com/7.x/initials/svg?seed=${parsedName}`]
+        `INSERT INTO users (id, full_name, phone, email, role, is_verified, avatar_url)
+         VALUES ($1, $2, $3, $4, $5, true, $6)`,
+        [newId, parsedName, target, `${target.replace('+', '')}@shazo-otp.com`, role, `https://api.dicebear.com/7.x/initials/svg?seed=${parsedName}`]
       );
 
       await db.query(
@@ -522,6 +580,340 @@ router.get("/me", requireAuth, async (req: Request, res: Response) => {
   }
 
   return sendSuccess(res, { user: userRows[0] });
+});
+
+/**
+ * POST /api/auth/signup-password
+ */
+router.post("/signup-password", async (req: Request, res: Response) => {
+  const { full_name, phone, password, default_city, email } = req.body;
+
+  if (!full_name || !phone || !password) {
+    return sendError(res, "VALIDATION_FAILED", "Full name, phone, and password are required.");
+  }
+
+  if (password.length < 8 || !/[a-zA-Z]/.test(password) || !/[0-9]/.test(password)) {
+    return sendError(res, "WEAK_PASSWORD", "Password must be at least 8 characters long, with at least one letter and one number.");
+  }
+
+  const target = normalizePakistanPhone(phone);
+  if (!isValidPakistanPhone(target)) {
+    return sendError(res, "INVALID_PHONE", "Phone number must be a valid Pakistani number.");
+  }
+
+  try {
+    const existing = await db.query("SELECT id FROM users WHERE phone = $1", [target]);
+    if (existing.length > 0) {
+      return sendError(res, "CONFLICT", "An account matching this phone number is already registered.", 409);
+    }
+
+    const cryptPassword = await bcrypt.hash(password, 10);
+    const userId = "usr_" + crypto.randomUUID().slice(0, 8);
+    const userEmail = email ? email.toLowerCase().trim() : `${target.replace('+', '')}@shazo-otp.com`;
+
+    await db.query(
+      `INSERT INTO users (id, full_name, email, phone, role, is_verified, password_hash, avatar_url, password_set_at)
+       VALUES ($1, $2, $3, $4, 'customer', false, $5, $6, NOW())`,
+      [userId, full_name, userEmail, target, cryptPassword, `https://api.dicebear.com/7.x/initials/svg?seed=${full_name}`]
+    );
+
+    await db.query(
+      `INSERT INTO auth_accounts (id, user_id, provider, provider_user_id)
+       VALUES ($1, $2, 'phone_password', $3)`,
+      ["auth_" + crypto.randomUUID().slice(0, 8), userId, target]
+    );
+
+    await db.query(
+      `INSERT INTO customer_profiles (user_id, default_city) VALUES ($1, $2)`, 
+      [userId, default_city || null]
+    );
+
+    // Send OTP
+    const rawPin = Math.floor(Math.pow(10, config.OTP_CODE_LENGTH - 1) + Math.random() * 9 * Math.pow(10, config.OTP_CODE_LENGTH - 1)).toString();
+    const pinHash = await bcrypt.hash(rawPin, 10);
+    const expiresAt = new Date(Date.now() + config.OTP_EXPIRY_MINUTES * 60000);
+    const otpId = "vfn_" + crypto.randomUUID().slice(0, 8);
+
+    await db.query(
+      `INSERT INTO otp_verifications (id, phone, normalized_phone, role, otp_hash, max_attempts, expires_at)
+       VALUES ($1, $2, $3, 'customer', $4, $5, $6)`,
+      [otpId, phone, target, pinHash, config.OTP_MAX_ATTEMPTS, expiresAt]
+    );
+
+    if (!config.OTP_BYPASS_ENABLED) {
+      if (config.OTP_PROVIDER === "n8n_webhook" && config.N8N_OTP_WEBHOOK_URL) {
+        try {
+          console.log(`[OTP_DISPATCH_SIGNUP] Provider: ${config.OTP_PROVIDER}`);
+          console.log(`[OTP_DISPATCH_SIGNUP] Webhook URL: ${config.N8N_OTP_WEBHOOK_URL}`);
+          console.log(`[OTP_DISPATCH_SIGNUP] Target Phone: ${target}`);
+
+          const response = await fetch(config.N8N_OTP_WEBHOOK_URL, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-shazo-webhook-secret": config.N8N_OTP_WEBHOOK_SECRET || ""
+            },
+            body: JSON.stringify({ 
+              event: "otp.requested",
+              request_id: otpId,
+              phone: target, 
+              normalized_phone: target,
+              otp: rawPin, 
+              role: "customer",
+              purpose: "signup",
+              message: `Your Shazo Ride verification code is ${rawPin}. This code will expire in ${config.OTP_EXPIRY_MINUTES} minutes. Do not share it with anyone.`,
+              expires_in_minutes: config.OTP_EXPIRY_MINUTES,
+              created_at: new Date().toISOString()
+            })
+          });
+
+          console.log(`[OTP_DISPATCH_SIGNUP] Webhook HTTP Status: ${response.status}`);
+          
+          let responseBody;
+          try {
+            responseBody = await response.json();
+            console.log(`[OTP_DISPATCH_SIGNUP] Webhook Response:`, JSON.stringify(responseBody));
+          } catch (e) {
+            responseBody = await response.text();
+            console.log(`[OTP_DISPATCH_SIGNUP] Webhook Text Response:`, responseBody);
+          }
+
+          if (!response.ok || responseBody?.ok === false) {
+            console.error("[N8N_WEBHOOK_ERROR] Signup OTP Failed with status:", response.status, "Body:", responseBody);
+            return sendError(res, "OTP_DISPATCH_FAILED", "OTP could not be sent via webhook.", 500);
+          }
+        } catch (e: any) {
+          console.error("[N8N_WEBHOOK_ERROR]", e.message);
+          return sendError(res, "OTP_DISPATCH_FAILED", "OTP could not be sent. Please try again.", 500);
+        }
+      } else {
+        const dispatched = await domainNotifier.dispatch(target, "otp", { otp: rawPin });
+        if (!dispatched) {
+          return sendError(res, "OTP_DISPATCH_FAILED", "OTP could not be sent on WhatsApp.", 500);
+        }
+      }
+    }
+
+    return sendSuccess(res, {
+      message: "Signup successful, OTP sent",
+      expiresInMinutes: config.OTP_EXPIRY_MINUTES
+    }, 201);
+
+  } catch (err: any) {
+    return sendError(res, "SIGNUP_FAILED", err.message, 500);
+  }
+});
+
+/**
+ * POST /api/auth/login-password
+ */
+router.post("/login-password", async (req: Request, res: Response) => {
+  const { phone, password } = req.body;
+
+  if (!phone || !password) {
+    return sendError(res, "VALIDATION_FAILED", "Both phone and password are required.");
+  }
+
+  const target = normalizePakistanPhone(phone);
+
+  try {
+    const userRows = await db.query("SELECT * FROM users WHERE phone = $1", [target]);
+    if (userRows.length === 0) {
+      return sendError(res, "INVALID_CREDENTIALS", "Incorrect phone number or password.", 401);
+    }
+
+    const matchedUser = userRows[0];
+    if (matchedUser.password_login_enabled === false) {
+      return sendError(res, "ACCOUNT_SUSPENDED", "Password login is disabled for this account.", 403);
+    }
+
+    if (!matchedUser.password_hash) {
+      return sendError(res, "OAUTH_ONLY_ACCOUNT", "This account is configured for mobile OTP only. Please login with OTP and set a password.", 403);
+    }
+
+    const isValid = await bcrypt.compare(password, matchedUser.password_hash);
+    if (!isValid) {
+      return sendError(res, "INVALID_CREDENTIALS", "Incorrect phone number or password.", 401);
+    }
+
+    const token = jwt.sign(
+      { userId: matchedUser.id, role: matchedUser.role },
+      config.JWT_SECRET,
+      { expiresIn: "30d" }
+    );
+
+    const sessionId = "ses_" + crypto.randomUUID().slice(0, 8);
+    await db.query(
+      `INSERT INTO sessions (id, user_id, role, token, expires_at)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [sessionId, matchedUser.id, matchedUser.role, token, new Date(Date.now() + 30 * 24 * 3600000)]
+    );
+
+    return sendSuccess(res, {
+      token,
+      user: {
+        id: matchedUser.id,
+        phone: matchedUser.phone,
+        role: matchedUser.role,
+        profile_completed: matchedUser.profile_completed || false
+      }
+    });
+
+  } catch (err: any) {
+    return sendError(res, "LOGIN_FAILED", err.message, 500);
+  }
+});
+
+/**
+ * POST /api/auth/set-password
+ */
+router.post("/set-password", requireAuth, async (req: Request, res: Response) => {
+  const authReq = req as AuthenticatedRequest;
+  const { password } = req.body;
+
+  if (!password || password.length < 8 || !/[a-zA-Z]/.test(password) || !/[0-9]/.test(password)) {
+    return sendError(res, "WEAK_PASSWORD", "Password must be at least 8 characters long, with at least one letter and one number.");
+  }
+
+  try {
+    const cryptPassword = await bcrypt.hash(password, 10);
+    await db.query(
+      "UPDATE users SET password_hash = $1, password_set_at = NOW() WHERE id = $2",
+      [cryptPassword, authReq.user.userId]
+    );
+    return sendSuccess(res, { message: "Password updated successfully" });
+  } catch (err: any) {
+    return sendError(res, "UPDATE_FAILED", err.message, 500);
+  }
+});
+
+/**
+ * POST /api/auth/forgot-password/request-otp
+ */
+router.post("/forgot-password/request-otp", async (req: Request, res: Response) => {
+  const { phone } = req.body;
+  const target = normalizePakistanPhone(phone);
+
+  try {
+    const existing = await db.query("SELECT id FROM users WHERE phone = $1", [target]);
+    if (existing.length > 0) {
+      const rawPin = Math.floor(Math.pow(10, config.OTP_CODE_LENGTH - 1) + Math.random() * 9 * Math.pow(10, config.OTP_CODE_LENGTH - 1)).toString();
+      const pinHash = await bcrypt.hash(rawPin, 10);
+      const expiresAt = new Date(Date.now() + config.OTP_EXPIRY_MINUTES * 60000);
+      const otpId = "vfn_" + crypto.randomUUID().slice(0, 8);
+
+      await db.query(
+        `INSERT INTO otp_verifications (id, phone, normalized_phone, role, otp_hash, max_attempts, expires_at)
+         VALUES ($1, $2, $3, 'password_reset', $4, $5, $6)`,
+        [otpId, phone, target, pinHash, config.OTP_MAX_ATTEMPTS, expiresAt]
+      );
+
+      if (!config.OTP_BYPASS_ENABLED) {
+        if (config.OTP_PROVIDER === "n8n_webhook" && config.N8N_OTP_WEBHOOK_URL) {
+          try {
+            console.log(`[OTP_DISPATCH_FORGOT] Provider: ${config.OTP_PROVIDER}`);
+            console.log(`[OTP_DISPATCH_FORGOT] Webhook URL: ${config.N8N_OTP_WEBHOOK_URL}`);
+            console.log(`[OTP_DISPATCH_FORGOT] Target Phone: ${target}`);
+
+            const response = await fetch(config.N8N_OTP_WEBHOOK_URL, {
+              method: "POST",
+              headers: { 
+                "Content-Type": "application/json", 
+                "x-shazo-webhook-secret": config.N8N_OTP_WEBHOOK_SECRET || "" 
+              },
+              body: JSON.stringify({ 
+                event: "otp.requested",
+                request_id: otpId,
+                phone: target, 
+                normalized_phone: target,
+                otp: rawPin, 
+                role: "password_reset",
+                purpose: "forgot_password",
+                message: `Your Shazo Ride verification code is ${rawPin}. This code will expire in ${config.OTP_EXPIRY_MINUTES} minutes. Do not share it with anyone.`,
+                expires_in_minutes: config.OTP_EXPIRY_MINUTES,
+                created_at: new Date().toISOString()
+              })
+            });
+
+            console.log(`[OTP_DISPATCH_FORGOT] Webhook HTTP Status: ${response.status}`);
+          
+            let responseBody;
+            try {
+              responseBody = await response.json();
+              console.log(`[OTP_DISPATCH_FORGOT] Webhook Response:`, JSON.stringify(responseBody));
+            } catch (e) {
+              responseBody = await response.text();
+              console.log(`[OTP_DISPATCH_FORGOT] Webhook Text Response:`, responseBody);
+            }
+          } catch (e: any) {
+            console.error("[N8N_WEBHOOK_ERROR] Forgot Password:", e.message);
+          }
+        } else {
+          await domainNotifier.dispatch(target, "otp", { otp: rawPin });
+        }
+      }
+    }
+    
+    // Always return success to prevent account enumeration
+    return sendSuccess(res, { message: "If an account exists, an OTP has been sent." });
+  } catch (err: any) {
+    return sendError(res, "REQUEST_FAILED", err.message, 500);
+  }
+});
+
+/**
+ * POST /api/auth/forgot-password/reset
+ */
+router.post("/forgot-password/reset", async (req: Request, res: Response) => {
+  const { phone, otp, new_password } = req.body;
+
+  if (!phone || !otp || !new_password) {
+    return sendError(res, "VALIDATION_FAILED", "Phone, OTP, and new password are required.");
+  }
+
+  if (new_password.length < 8 || !/[a-zA-Z]/.test(new_password) || !/[0-9]/.test(new_password)) {
+    return sendError(res, "WEAK_PASSWORD", "Password must be at least 8 characters long, with at least one letter and one number.");
+  }
+
+  const target = normalizePakistanPhone(phone);
+
+  try {
+    const records = await db.query(
+      `SELECT * FROM otp_verifications 
+       WHERE normalized_phone = $1 AND role = 'password_reset' AND verified_at IS NULL AND expires_at > NOW()
+       ORDER BY created_at DESC LIMIT 1`,
+      [target]
+    );
+
+    if (records.length === 0) {
+      return sendError(res, "OTP_NOT_FOUND", "No active OTP found or OTP has expired.");
+    }
+
+    const matchedOtp = records[0];
+
+    if (matchedOtp.attempts >= matchedOtp.max_attempts) {
+      return sendError(res, "BLOCKED_ATTEMPTS", "Maximum attempts exceeded. Request a new OTP.", 403);
+    }
+
+    const isValid = await bcrypt.compare(otp.toString(), matchedOtp.otp_hash);
+
+    if (!isValid) {
+      await db.query("UPDATE otp_verifications SET attempts = attempts + 1, updated_at = NOW() WHERE id = $1", [matchedOtp.id]);
+      return sendError(res, "WRONG_CODE", "The OTP provided is incorrect.", 400);
+    }
+
+    await db.query("UPDATE otp_verifications SET verified_at = NOW(), updated_at = NOW() WHERE id = $1", [matchedOtp.id]);
+
+    const cryptPassword = await bcrypt.hash(new_password, 10);
+    await db.query(
+      "UPDATE users SET password_hash = $1, password_set_at = NOW() WHERE phone = $2",
+      [cryptPassword, target]
+    );
+
+    return sendSuccess(res, { message: "Password has been successfully reset." });
+  } catch (err: any) {
+    return sendError(res, "RESET_FAILED", err.message, 500);
+  }
 });
 
 export default router;

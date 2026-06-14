@@ -1,6 +1,7 @@
 import { evolutionService } from "./evolution-whatsapp.service";
 import { sendEmail, sendSMS } from "../utils/notify"; // fallback to existing for email/sms
 import { config } from "../config/index";
+import { db } from "../db/index";
 
 export type NotificationEvent =
   | "otp"
@@ -20,6 +21,7 @@ export type NotificationEvent =
 export class NotificationService {
   /**
    * Dispatch a notification using the configured primary channel (WhatsApp via Evolution)
+   * Logs attempt to whatsapp_outbound_logs
    */
   public async dispatch(
     phone: string,
@@ -29,15 +31,44 @@ export class NotificationService {
     const message = this.buildMessage(event, payload);
 
     if (config.OTP_PROVIDER === "whatsapp_evolution" || config.WHATSAPP_PROVIDER === "evolution") {
+      let logId: string | number = 0;
+      
       try {
-        await evolutionService.sendTextMessage(phone, message);
+        // Log Pending
+        const logRes = await db.query(
+          `INSERT INTO whatsapp_outbound_logs 
+           (provider, instance_name, phone, normalized_phone, message_type, status, request_payload) 
+           VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+          ["evolution", config.EVOLUTION_INSTANCE_NAME, phone, phone, event, "pending", JSON.stringify({ message: event === "otp" ? "OTP ***" : message })]
+        );
+        logId = logRes[0]?.id;
+
+        const response = await evolutionService.sendTextMessage(phone, message);
+        
+        // Log Success
+        if (logId) {
+          await db.query(
+            `UPDATE whatsapp_outbound_logs SET status = 'sent', response_payload = $1 WHERE id = $2`,
+            [JSON.stringify(response), logId]
+          );
+        }
         return true;
-      } catch (err) {
-        console.error(`Failed to dispatch ${event} via Evolution API. Falling back if configured.`);
+      } catch (err: any) {
+        console.error(`Failed to dispatch ${event} via Evolution API.`, err.message);
+        
+        // Log Failure
+        if (logId) {
+          await db.query(
+            `UPDATE whatsapp_outbound_logs SET status = 'failed', error_message = $1 WHERE id = $2`,
+            [err.message, logId]
+          );
+        }
+        
+        return false;
       }
     }
 
-    // Optional: Fallback logic for SMS/Email can go here
+    // Fallbacks
     return false;
   }
 

@@ -748,25 +748,50 @@ router.post("/integrations/evolution/configure-webhook", async (req: Request, re
 
 router.get("/integrations/whatsapp/diagnostics", async (req: Request, res: Response) => {
   try {
-    const otps = await safeRows("otps", "SELECT id, normalized_phone as phone, role, created_at, expires_at, verified_at, attempts, max_attempts FROM otp_verifications ORDER BY created_at DESC LIMIT 50");
+    const otps = await safeRows("otps", "SELECT id, normalized_phone as phone, role, created_at, expires_at, verified_at, attempts, max_attempts FROM otp_verifications ORDER BY created_at DESC LIMIT 10");
     const isWhatsAppOnline = await evolutionService.testConnection();
     
     // Check recent webhook logs
     const webhookLogs = await safeRows("webhooks", "SELECT * FROM whatsapp_event_logs ORDER BY created_at DESC LIMIT 10");
+    
+    // Check recent outbound logs
+    const outboundLogs = await safeRows("outbounds", "SELECT * FROM whatsapp_outbound_logs ORDER BY created_at DESC LIMIT 20");
 
     return sendSuccess(res, {
       diagnostics: {
-        whatsapp_api_online: isWhatsAppOnline,
-        webhook_health: webhookLogs.length > 0 ? "receiving" : "no_recent_events"
+        provider_configured: !!process.env.OTP_PROVIDER || "whatsapp_evolution",
+        instance_name: process.env.EVOLUTION_INSTANCE_NAME,
+        instance_connection_status: isWhatsAppOnline ? "connected" : "disconnected",
+        webhook_url: process.env.EVOLUTION_WEBHOOK_URL,
+        webhook_health: webhookLogs.length > 0 ? "receiving" : "no_recent_events",
+        last_error: outboundLogs.find(l => l.status === 'failed')?.error_message || null
       },
       recent_otps: otps.map(otp => ({
         ...otp,
         status: otp.verified_at ? 'verified' : (new Date(otp.expires_at) < new Date() ? 'expired' : (otp.attempts >= otp.max_attempts ? 'blocked' : 'pending'))
       })),
+      recent_send_attempts: outboundLogs,
       recent_webhooks: webhookLogs
     });
   } catch (error: any) {
     return sendError(res, "DIAGNOSTICS_FAILED", error.message);
+  }
+});
+
+router.post("/integrations/whatsapp/test-send", async (req: Request, res: Response) => {
+  const { phone, message } = req.body;
+  if (!phone || !message) {
+    return sendError(res, "VALIDATION_FAILED", "Phone and message are required.");
+  }
+  
+  try {
+    const response = await evolutionService.sendTextMessage(phone, message);
+    return sendSuccess(res, {
+      message: "Message sent successfully",
+      data: response
+    });
+  } catch (err: any) {
+    return sendError(res, "SEND_FAILED", err.message, 500);
   }
 });
 

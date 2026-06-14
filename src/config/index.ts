@@ -33,6 +33,11 @@ const configSchema = z.object({
   OTP_RESEND_COOLDOWN_SECONDS: z.preprocess((val) => Number(val) || 60, z.number().default(60)),
   OTP_BYPASS_ENABLED: z.preprocess((val) => val === "true", z.boolean().default(false)),
   OTP_TEST_CODE: z.string().default("123456"),
+  CUSTOMER_TEST_LOGIN_ENABLED: z.preprocess((val) => val === "true", z.boolean().default(false)),
+  CUSTOMER_TEST_PHONE: z.string().default("923183765294"),
+  CUSTOMER_TEST_OTP: z.string().default("123456"),
+  N8N_OTP_WEBHOOK_URL: z.string().optional(),
+  N8N_OTP_WEBHOOK_SECRET: z.string().optional(),
 
   // Evolution WhatsApp Gateway API
   WHATSAPP_PROVIDER: z.string().default("evolution"),
