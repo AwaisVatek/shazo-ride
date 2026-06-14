@@ -184,6 +184,50 @@ router.patch("/restaurants/:id", async (req: AuthenticatedRequest, res: Response
   return sendSuccess(res, okMessage("Restaurant updated."));
 });
 
+router.get("/restaurants/:id/menu", async (req: AuthenticatedRequest, res: Response) => {
+  await safeRows("init restaurant menu", `
+    CREATE TABLE IF NOT EXISTS restaurant_categories (
+      id TEXT PRIMARY KEY,
+      restaurant_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      description TEXT,
+      sort_order INTEGER DEFAULT 0,
+      is_active BOOLEAN DEFAULT true,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      updated_at TIMESTAMPTZ DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS restaurant_menu_items (
+      id TEXT PRIMARY KEY,
+      category_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      description TEXT,
+      price NUMERIC(10,2) NOT NULL DEFAULT 0,
+      image_url TEXT,
+      is_available BOOLEAN DEFAULT true,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      updated_at TIMESTAMPTZ DEFAULT now()
+    );
+  `);
+
+  const items = await safeRows("menu items", `
+    SELECT mi.id, mi.name, mi.price, mi.is_available AS "isAvailable", c.name AS category
+    FROM restaurant_menu_items mi
+    JOIN restaurant_categories c ON c.id = mi.category_id
+    WHERE c.restaurant_id = $1
+    ORDER BY c.sort_order, mi.name
+  `, [req.params.id]);
+
+  return sendSuccess(res, items);
+});
+
+router.patch("/restaurants/menu/:itemId", async (req: AuthenticatedRequest, res: Response) => {
+  const isAvailable = req.body?.isAvailable;
+  if (isAvailable !== undefined) {
+    await safeRows("update menu item", "UPDATE restaurant_menu_items SET is_available = $1, updated_at = NOW() WHERE id = $2", [isAvailable, req.params.itemId]);
+  }
+  return sendSuccess(res, okMessage("Menu item updated"));
+});
+
 router.get("/rides", async (req: AuthenticatedRequest, res: Response) => {
   const items = await safeRows("rides", `
     SELECT rb.*, c.full_name AS customer_name, c.phone AS customer_phone, r.full_name AS rider_name, r.phone AS rider_phone
@@ -295,22 +339,41 @@ router.patch("/settings/manual-payment-accounts/:id", async (req: AuthenticatedR
 });
 
 router.get("/settings/fares", async (req: AuthenticatedRequest, res: Response) => {
+  await safeRows("init fare settings", `
+    CREATE TABLE IF NOT EXISTS fare_settings (
+      id TEXT PRIMARY KEY,
+      service_type TEXT NOT NULL UNIQUE,
+      service_label TEXT NOT NULL,
+      base_fare NUMERIC(10,2) NOT NULL DEFAULT 0,
+      per_km_rate NUMERIC(10,2) NOT NULL DEFAULT 0,
+      per_minute_rate NUMERIC(10,2) NOT NULL DEFAULT 0,
+      minimum_fare NUMERIC(10,2) NOT NULL DEFAULT 0,
+      cancellation_fee NUMERIC(10,2) NOT NULL DEFAULT 0,
+      night_surcharge NUMERIC(10,2) NOT NULL DEFAULT 0,
+      peak_time_multiplier NUMERIC(10,2) NOT NULL DEFAULT 1,
+      free_waiting_minutes INTEGER NOT NULL DEFAULT 0,
+      waiting_charge_per_minute NUMERIC(10,2) NOT NULL DEFAULT 0,
+      is_active BOOLEAN NOT NULL DEFAULT true,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+
   const items = await safeRows<any>("fares", `
     SELECT
       id,
       service_type,
-      service_type AS name,
+      service_label AS name,
       base_fare,
       per_km_rate,
       per_minute_rate,
       minimum_fare,
-      commission_percentage,
-      commission_fixed,
+      cancellation_fee AS cancel_fee,
+      peak_time_multiplier AS peak_hour_multiplier,
       is_active,
-      settings,
       created_at,
       updated_at
-    FROM service_settings
+    FROM fare_settings
     ORDER BY service_type ASC
   `);
 
@@ -318,23 +381,63 @@ router.get("/settings/fares", async (req: AuthenticatedRequest, res: Response) =
 });
 
 router.post("/settings/fares", async (req: AuthenticatedRequest, res: Response) => {
-  return sendSuccess(res, okMessage("Fare settings endpoint received. Use PATCH /api/admin/settings for individual service changes."));
+  const fares = req.body?.fares || [];
+  for (const fare of fares) {
+    await safeRows("save fare", `
+      INSERT INTO fare_settings (id, service_type, service_label, base_fare, per_km_rate, per_minute_rate, minimum_fare, cancellation_fee, peak_time_multiplier)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      ON CONFLICT (service_type) DO UPDATE SET 
+        service_label = EXCLUDED.service_label,
+        base_fare = EXCLUDED.base_fare,
+        per_km_rate = EXCLUDED.per_km_rate,
+        per_minute_rate = EXCLUDED.per_minute_rate,
+        minimum_fare = EXCLUDED.minimum_fare,
+        cancellation_fee = EXCLUDED.cancellation_fee,
+        peak_time_multiplier = EXCLUDED.peak_time_multiplier,
+        updated_at = NOW()
+    `, [
+      `fare_${fare.serviceType}`,
+      fare.serviceType,
+      fare.serviceLabel || fare.serviceType,
+      Number(fare.baseFare || 0),
+      Number(fare.perKmRate || 0),
+      Number(fare.perMinRate || 0),
+      Number(fare.minimumFare || 0),
+      Number(fare.cancelFee || 0),
+      Number(fare.peakHourMultiplier || 1)
+    ]);
+  }
+  return sendSuccess(res, okMessage("Fare settings saved."));
 });
 
 router.get("/settings/commissions", async (req: AuthenticatedRequest, res: Response) => {
+  await safeRows("init commission settings", `
+    CREATE TABLE IF NOT EXISTS commission_settings (
+      id TEXT PRIMARY KEY,
+      service_type TEXT NOT NULL UNIQUE,
+      service_label TEXT NOT NULL,
+      commission_type TEXT NOT NULL DEFAULT 'percentage',
+      commission_rate NUMERIC(10,2) NOT NULL DEFAULT 0,
+      minimum_platform_cut NUMERIC(10,2) NOT NULL DEFAULT 0,
+      driver_share_percentage NUMERIC(10,2) NOT NULL DEFAULT 0,
+      is_active BOOLEAN NOT NULL DEFAULT true,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+
   const items = await safeRows<any>("commissions", `
     SELECT
       id,
       service_type,
-      service_type AS name,
-      commission_percentage,
-      commission_fixed,
-      base_fare,
-      minimum_fare,
+      service_label AS name,
+      commission_rate AS commission_percentage,
+      minimum_platform_cut AS minimum_platform_cut,
+      commission_type,
       is_active,
       created_at,
       updated_at
-    FROM service_settings
+    FROM commission_settings
     ORDER BY service_type ASC
   `);
 
@@ -342,7 +445,27 @@ router.get("/settings/commissions", async (req: AuthenticatedRequest, res: Respo
 });
 
 router.post("/settings/commissions", async (req: AuthenticatedRequest, res: Response) => {
-  return sendSuccess(res, okMessage("Commission settings endpoint received. Use PATCH /api/admin/settings for individual service changes."));
+  const commissions = req.body?.commissions || [];
+  for (const comm of commissions) {
+    await safeRows("save commission", `
+      INSERT INTO commission_settings (id, service_type, service_label, commission_rate, minimum_platform_cut, commission_type)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      ON CONFLICT (service_type) DO UPDATE SET 
+        service_label = EXCLUDED.service_label,
+        commission_rate = EXCLUDED.commission_rate,
+        minimum_platform_cut = EXCLUDED.minimum_platform_cut,
+        commission_type = EXCLUDED.commission_type,
+        updated_at = NOW()
+    `, [
+      `comm_${comm.serviceType}`,
+      comm.serviceType,
+      comm.serviceLabel || comm.serviceType,
+      Number(comm.commissionPercentage || 0),
+      Number(comm.minCommissionPKR || 0),
+      comm.variablePeakHourlyCharge ? 'variable' : 'percentage'
+    ]);
+  }
+  return sendSuccess(res, okMessage("Commission settings saved."));
 });
 
 router.get("/settings/maintenance", async (req: AuthenticatedRequest, res: Response) => {

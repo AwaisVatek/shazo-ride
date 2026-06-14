@@ -168,6 +168,38 @@ export async function seed() {
        ('tkt_sample_2', 'usr_rider', 'RIDER', 'documentation', 'Approval of my CNIC documents', 'My CNIC has been uploaded, please verify so I can accept ride dispatch targets.', 'high', 'open')`
     );
 
+    // 12. Mock Data for Bookings and Dispatch
+    await db.query(
+      `INSERT INTO ride_bookings (id, customer_id, rider_id, service_type, status, pickup_address, dropoff_address, pickup_lat, pickup_lng, total_fare) VALUES
+       ('ride_demo_1', 'usr_customer', 'usr_rider', 'bike', 'completed', 'Clifton Block 5, Karachi', 'DHA Phase 6, Karachi', 24.8183, 67.0343, 190.00),
+       ('ride_demo_2', 'usr_customer', NULL, 'car', 'pending_rider_match', 'Gulshan-e-Iqbal, Karachi', 'Saddar, Karachi', 24.91, 67.08, 450.00)`
+    );
+
+    await db.query(
+      `INSERT INTO ambulance_bookings (id, customer_id, emergency_type, pickup_address, hospital_address, status, total_fare) VALUES
+       ('amb_demo_1', 'usr_customer', 'medical_emergency', 'DHA Phase 6, Karachi', 'South City Hospital', 'pending_rider_match', 0)`
+    );
+
+    await db.query(
+      `INSERT INTO food_orders (id, customer_id, restaurant_id, status, delivery_address, total_amount) VALUES
+       ('food_demo_1', 'usr_customer', 'rest_kababjees', 'ordered', 'Apartment 4B, Clifton Block 5, Karachi', 520.00)`
+    );
+
+    // 13. Safety Reports
+    await db.query(
+      `INSERT INTO safety_reports (id, reporter_id, reporter_role, booking_id, incident_type, description, investigation_status) VALUES
+       ('safe_demo_1', 'usr_customer', 'customer', 'ride_demo_1', 'reckless_driving', 'Driver was speeding.', 'open')`
+    );
+
+    // 14. Commission Settings
+    await db.query(
+      `INSERT INTO commission_settings (id, service_type, service_label, commission_rate, minimum_platform_cut, commission_type) VALUES
+       ('comm_bike', 'bike', 'Bike Ride', 10.00, 20.00, 'percentage'),
+       ('comm_car_mini', 'car_mini', 'Car Mini', 12.00, 30.00, 'percentage'),
+       ('comm_food_delivery', 'food_delivery', 'Food Delivery', 15.00, 50.00, 'percentage'),
+       ('comm_ambulance', 'ambulance', 'Ambulance Free', 0.00, 0.00, 'percentage')`
+    );
+
     console.log("✅ Seed database setup finished successfully.");
   } catch (err: any) {
     console.error("❌ Seed database script failed:", err.message);
