@@ -23,7 +23,7 @@ const configSchema = z.object({
   DEFAULT_CURRENCY: z.string().default("PKR"),
 
   // OTP Configuration Setup
-  OTP_PROVIDER: z.string().default("whatsapp_evolution"),
+  OTP_PROVIDER: z.string().default("n8n_webhook"),
   OTP_PRIMARY_CHANNEL: z.enum(["whatsapp", "email", "sms"]).default("whatsapp"),
   OTP_FALLBACK_CHANNEL: z.enum(["whatsapp", "email", "sms"]).default("email"),
   OTP_ENABLE_SMS_FALLBACK: z.preprocess((val) => val === "true", z.boolean().default(false)),
@@ -33,11 +33,11 @@ const configSchema = z.object({
   OTP_RESEND_COOLDOWN_SECONDS: z.preprocess((val) => Number(val) || 60, z.number().default(60)),
   OTP_BYPASS_ENABLED: z.preprocess((val) => val === "true", z.boolean().default(false)),
   OTP_TEST_CODE: z.string().default("123456"),
-  CUSTOMER_TEST_LOGIN_ENABLED: z.preprocess((val) => val === "true", z.boolean().default(false)),
+  CUSTOMER_TEST_LOGIN_ENABLED: z.preprocess((val) => val === "true" || val === undefined, z.boolean().default(true)),
   CUSTOMER_TEST_PHONE: z.string().default("923183765294"),
   CUSTOMER_TEST_OTP: z.string().default("123456"),
-  N8N_OTP_WEBHOOK_URL: z.string().optional(),
-  N8N_OTP_WEBHOOK_SECRET: z.string().optional(),
+  N8N_OTP_WEBHOOK_URL: z.string().default("https://n8n.visioninfinity.co/webhook/shazo-otp"),
+  N8N_OTP_WEBHOOK_SECRET: z.string().default("shazo_secret_2026"),
 
   // Evolution WhatsApp Gateway API
   WHATSAPP_PROVIDER: z.string().default("evolution"),
