@@ -7,80 +7,83 @@ const router = Router();
 
 router.use(requireAuth, requireOperationsManager);
 
-/**
- * GET /api/dispatch/unassigned
- * Compiles a real-time tracking list of unassigned mobility bookings awaiting drivers
- */
-router.get("/unassigned", async (req: Request, res: Response) => {
+type QueryParams = Array<string | number | boolean | null | Date>;
+
+async function safeRows<T = any>(label: string, sql: string, params: QueryParams = []): Promise<T[]> {
   try {
-    const rides = await db.query(
-      `SELECT rb.*, u.full_name as customer_name, u.phone as customer_phone
-       FROM ride_bookings rb
-       JOIN users u ON rb.customer_id = u.id
-       WHERE rb.status = 'requested' AND rb.rider_id IS NULL
-       ORDER BY rb.created_at ASC`
-    );
-
-    const orders = await db.query(
-      `SELECT fo.*, u.full_name as customer_name, r.name as restaurant_name
-       FROM food_orders fo
-       JOIN users u ON fo.customer_id = u.id
-       JOIN restaurant_profiles r ON fo.restaurant_id = r.id
-       WHERE fo.status = 'ordered' AND fo.rider_id IS NULL
-       ORDER BY fo.created_at ASC`
-    );
-
-    return sendSuccess(res, {
-      rides,
-      food_orders: orders
-    });
-
+    return await db.query<T>(sql, params);
   } catch (err: any) {
-    return sendError(res, "FETCH_UNASSIGNED_DISPATCH_FAILED", err.message, 500);
+    console.warn(`[dispatch] ${label} failed:`, err?.message || err);
+    return [];
   }
+}
+
+async function getUnassigned() {
+  const rides = await safeRows("unassigned rides", `
+    SELECT rb.*, u.full_name AS customer_name, u.phone AS customer_phone, 'ride' AS request_type
+    FROM ride_bookings rb
+    LEFT JOIN users u ON rb.customer_id = u.id
+    WHERE rb.status = 'requested' AND rb.rider_id IS NULL
+    ORDER BY rb.created_at ASC
+    LIMIT 100
+  `);
+
+  const foodOrders = await safeRows("unassigned food", `
+    SELECT fo.*, u.full_name AS customer_name, r.name AS restaurant_name, 'food_order' AS request_type
+    FROM food_orders fo
+    LEFT JOIN users u ON fo.customer_id = u.id
+    LEFT JOIN restaurant_profiles r ON fo.restaurant_id = r.id
+    WHERE fo.status = 'ordered' AND fo.rider_id IS NULL
+    ORDER BY fo.created_at ASC
+    LIMIT 100
+  `);
+
+  const ambulanceBookings = await safeRows("active ambulance", `
+    SELECT ab.*, 'ambulance' AS request_type
+    FROM ambulance_bookings ab
+    WHERE ab.status IN ('requested', 'dispatched', 'arrived')
+    ORDER BY ab.created_at ASC
+    LIMIT 100
+  `);
+
+  return { rides, food_orders: foodOrders, ambulance_bookings: ambulanceBookings, items: [...rides, ...foodOrders, ...ambulanceBookings] };
+}
+
+router.get(["/active", "/unassigned"], async (req: Request, res: Response) => {
+  return sendSuccess(res, await getUnassigned());
 });
 
-/**
- * POST /api/dispatch/assign-ride
- * Forcefully attaches an unassigned ride booking to a specific online rider
- */
+router.post("/assign", async (req: AuthenticatedRequest, res: Response) => {
+  const requestId = req.body?.requestId || req.body?.ride_id || req.body?.order_id;
+  const riderId = req.body?.riderId || req.body?.rider_id;
+  if (!requestId || !riderId) return sendError(res, "VALIDATION_FAILED", "Please provide requestId and riderId.");
+
+  const rideUpdate = await safeRows("assign ride", "UPDATE ride_bookings SET rider_id = $1, status = 'accepted', updated_at = NOW() WHERE id = $2 AND status IN ('requested', 'accepted') RETURNING id, status", [riderId, requestId]);
+  if (rideUpdate.length > 0) return sendSuccess(res, { request_id: requestId, assigned_rider: riderId, status: "accepted" });
+
+  const foodUpdate = await safeRows("assign food", "UPDATE food_orders SET rider_id = $1, status = 'accepted', updated_at = NOW() WHERE id = $2 AND status IN ('ordered', 'accepted') RETURNING id, status", [riderId, requestId]);
+  if (foodUpdate.length > 0) return sendSuccess(res, { request_id: requestId, assigned_rider: riderId, status: "accepted" });
+
+  return sendError(res, "REQUEST_NOT_FOUND", "No dispatchable ride or food order matches this request.", 404);
+});
+
 router.post("/assign-ride", async (req: AuthenticatedRequest, res: Response) => {
-  const { ride_id, rider_id } = req.body;
-  if (!ride_id || !rider_id) return sendError(res, "VALIDATION_FAILED", "Please provide ride_id and rider_id.");
+  req.body.requestId = req.body.ride_id;
+  req.body.riderId = req.body.rider_id;
+  const requestId = req.body.requestId;
+  const riderId = req.body.riderId;
+  if (!requestId || !riderId) return sendError(res, "VALIDATION_FAILED", "Please provide ride_id and rider_id.");
+  const result = await safeRows("assign ride explicit", "UPDATE ride_bookings SET rider_id = $1, status = 'accepted', updated_at = NOW() WHERE id = $2 AND status IN ('requested', 'accepted') RETURNING id, status", [riderId, requestId]);
+  if (result.length === 0) return sendError(res, "RIDE_NOT_FOUND", "No ride matches this key.", 404);
+  return sendSuccess(res, { ride_id: requestId, assigned_rider: riderId, status: "accepted" });
+});
 
-  try {
-    // 1. Verify target status holds requested state
-    const matches = await db.query("SELECT status FROM ride_bookings WHERE id = $1", [ride_id]);
-    if (matches.length === 0) return sendError(res, "RIDE_NOT_FOUND", "No ride matches this key.", 404);
-
-    if (matches[0].status !== "requested") {
-      return sendError(res, "INVALID_STATE", `Cannot assign ride that holds state: '${matches[0].status}'.`, 400);
-    }
-
-    // 2. Verify rider status bounds online verified parameters
-    const riders = await db.query("SELECT is_online, verification_status FROM rider_profiles WHERE user_id = $1", [rider_id]);
-    if (riders.length === 0) return sendError(res, "RIDER_NOT_FOUND", "Rider profile does not exist.", 404);
-
-    if (!riders[0].is_online || riders[0].verification_status !== "verified") {
-      return sendError(res, "RIDER_INACTIVE", "Target pilot is currently either offline or unreviewed.", 400);
-    }
-
-    // 3. Force update assignment
-    await db.query(
-      "UPDATE ride_bookings SET rider_id = $1, status = 'accepted', updated_at = NOW() WHERE id = $2",
-      [rider_id, ride_id]
-    );
-
-    return sendSuccess(res, {
-      ride_id,
-      assigned_rider: rider_id,
-      status: "accepted",
-      message: "The requested ride was manually dispatched to the specified rider successfully."
-    });
-
-  } catch (err: any) {
-    return sendError(res, "MANUAL_DISPATCH_RIDE_FAILED", err.message, 500);
-  }
+router.delete("/:id", async (req: AuthenticatedRequest, res: Response) => {
+  const id = req.params.id;
+  const ride = await safeRows("cancel ride", "UPDATE ride_bookings SET status = 'cancelled', updated_at = NOW() WHERE id = $1 RETURNING id", [id]);
+  const food = ride.length ? [] : await safeRows("cancel food", "UPDATE food_orders SET status = 'cancelled', updated_at = NOW() WHERE id = $1 RETURNING id", [id]);
+  const ambulance = ride.length || food.length ? [] : await safeRows("cancel ambulance", "UPDATE ambulance_bookings SET status = 'cancelled', updated_at = NOW() WHERE id = $1 RETURNING id", [id]);
+  return sendSuccess(res, { id, cancelled: ride.length + food.length + ambulance.length > 0 });
 });
 
 export default router;

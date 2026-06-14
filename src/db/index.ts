@@ -88,18 +88,29 @@ class DatabaseManager {
   public async migrate(): Promise<void> {
     try {
       console.log("🔋 Loading local migration schemas...");
-      const migrationFile = path.resolve(process.cwd(), "src/migrations/0001_initial.sql");
-      
-      if (fs.existsSync(migrationFile)) {
-        const migrationSql = fs.readFileSync(migrationFile, "utf-8");
-        console.log("⚡ Executing manual initial schema migrations...");
-        
-        // Execute whole migrations block loaded from SQL file
-        await this.pool!.query(migrationSql);
-        console.log("🚀 Schema successfully applied/verified manual migrations.");
-      } else {
-        throw new Error(`Migration source schema file not detected at path: ${migrationFile}`);
+      const migrationsDir = path.resolve(process.cwd(), "src/migrations");
+
+      if (!fs.existsSync(migrationsDir)) {
+        throw new Error(`Migration directory not detected at path: ${migrationsDir}`);
       }
+
+      const migrationFiles = fs
+        .readdirSync(migrationsDir)
+        .filter((file) => file.endsWith(".sql"))
+        .sort();
+
+      if (migrationFiles.length === 0) {
+        throw new Error(`No SQL migration files detected at path: ${migrationsDir}`);
+      }
+
+      for (const file of migrationFiles) {
+        const migrationPath = path.join(migrationsDir, file);
+        const migrationSql = fs.readFileSync(migrationPath, "utf-8");
+        console.log(`⚡ Executing migration: ${file}`);
+        await this.pool!.query(migrationSql);
+      }
+
+      console.log("🚀 Schema successfully applied/verified manual migrations.");
     } catch (err: any) {
       console.error("❌ Database manual migration failed:", err.message);
       throw err;
