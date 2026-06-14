@@ -396,10 +396,10 @@ router.post("/request-otp", async (req: Request, res: Response) => {
     );
 
     // Send OTP
-    if (!config.OTP_BYPASS_ENABLED && !isTestCustomer) {
-      if (config.OTP_PROVIDER === "n8n_webhook" && config.N8N_OTP_WEBHOOK_URL) {
+    if (!config.OTP_BYPASS_ENABLED) {
+      // Always prefer n8n webhook if URL is defined, regardless of OTP_PROVIDER env var
+      if (config.N8N_OTP_WEBHOOK_URL) {
         try {
-          console.log(`[OTP_DISPATCH] Provider: ${config.OTP_PROVIDER}`);
           console.log(`[OTP_DISPATCH] Webhook URL: ${config.N8N_OTP_WEBHOOK_URL}`);
           console.log(`[OTP_DISPATCH] Target Phone: ${target}`);
 
@@ -641,9 +641,8 @@ router.post("/signup-password", async (req: Request, res: Response) => {
     );
 
     if (!config.OTP_BYPASS_ENABLED) {
-      if (config.OTP_PROVIDER === "n8n_webhook" && config.N8N_OTP_WEBHOOK_URL) {
+      if (config.N8N_OTP_WEBHOOK_URL) {
         try {
-          console.log(`[OTP_DISPATCH_SIGNUP] Provider: ${config.OTP_PROVIDER}`);
           console.log(`[OTP_DISPATCH_SIGNUP] Webhook URL: ${config.N8N_OTP_WEBHOOK_URL}`);
           console.log(`[OTP_DISPATCH_SIGNUP] Target Phone: ${target}`);
 
