@@ -373,8 +373,8 @@ router.get("/finance/wallet-ledger", async (req: AuthenticatedRequest, res: Resp
       wl.*,
       u.full_name AS rider_name,
       u.phone AS rider_phone
-    FROM wallet_ledger wl
-    LEFT JOIN rider_profiles rp ON rp.id = wl.rider_id
+    FROM rider_wallet_ledger wl
+    LEFT JOIN rider_profiles rp ON rp.user_id = wl.rider_id
     LEFT JOIN users u ON u.id = rp.user_id
     ORDER BY wl.created_at DESC
     LIMIT 100

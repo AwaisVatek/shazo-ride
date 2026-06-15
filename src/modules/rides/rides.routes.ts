@@ -488,7 +488,7 @@ router.post("/:id/emergency", requireAuth, async (req: AuthenticatedRequest, res
     console.error(urgentMsg);
     
     // Attempt WhatsApp alerts logic to admin emergency desk
-    await sendWhatsApp("+923001234567", urgentMsg).catch(() => {});
+    await sendWhatsApp("+923393570109", urgentMsg).catch(() => {});
 
     return sendSuccess(res, {
       reportId,
