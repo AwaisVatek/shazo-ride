@@ -1,4 +1,4 @@
-import { Router, Response } from "express";
+import { Router, Request, Response } from "express";
 import crypto from "crypto";
 import { requireAuth, requireRider, requireWalletEligibleRider, AuthenticatedRequest } from "../../middleware/auth";
 import { sendSuccess, sendError } from "../../utils/response";
@@ -44,14 +44,14 @@ router.patch("/toggle-online", requireWalletEligibleRider, async (req: Authentic
 router.get("/wallet", async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
   try {
-    const wallets = await db.query("SELECT balance FROM rider_wallets WHERE rider_id = $1", [authReq.user.userId]);
+    const wallets = await db.query("SELECT balance FROM rider_wallets WHERE rider_id = $1", [authReq.user!.id]);
     const balance = wallets.length > 0 ? Number(wallets[0].balance) : 0.00;
 
     const ledger = await db.query(
       `SELECT * FROM rider_wallet_ledger 
        WHERE rider_id = $1 
        ORDER BY created_at DESC LIMIT 50`,
-      [authReq.user.userId]
+      [authReq.user!.id]
     );
 
     return sendSuccess(res, {
@@ -80,7 +80,7 @@ router.post("/wallet/topup", async (req: Request, res: Response) => {
     // Check for duplicate pending transaction
     const existing = await db.query(
       "SELECT id FROM wallet_topups WHERE transaction_id = $1 OR (rider_id = $2 AND status = 'pending')",
-      [transaction_id, authReq.user.userId]
+      [transaction_id, authReq.user!.id]
     );
 
     if (existing.length > 0) {
@@ -91,7 +91,7 @@ router.post("/wallet/topup", async (req: Request, res: Response) => {
     await db.query(
       `INSERT INTO wallet_topups (id, rider_id, amount, payment_method, transaction_id, status)
        VALUES ($1, $2, $3, $4, $5, 'pending')`,
-      [topupId, authReq.user.userId, amount, payment_method, transaction_id]
+      [topupId, authReq.user!.id, amount, payment_method, transaction_id]
     );
 
     return sendSuccess(res, { message: "Top-up request submitted successfully. It will be verified by an admin shortly." });
@@ -179,7 +179,7 @@ router.get("/me", async (req: Request, res: Response) => {
        FROM users u
        LEFT JOIN rider_profiles rp ON u.id = rp.user_id
        WHERE u.id = $1`,
-      [authReq.user.userId] // Fixed `req.user!.id` references for JWT setup
+      [authReq.user!.id] // Fixed `req.user!.id` references for JWT setup
     );
 
     if (userRows.length === 0) {
@@ -210,7 +210,7 @@ router.patch("/me", async (req: Request, res: Response) => {
           avatar_url = COALESCE($3, avatar_url),
           updated_at = NOW()
          WHERE id = $4`,
-        [full_name, email, profile_image_url, authReq.user.userId]
+        [full_name, email, profile_image_url, authReq.user!.id]
       );
     }
 
@@ -222,7 +222,7 @@ router.patch("/me", async (req: Request, res: Response) => {
           vehicle_number = COALESCE($3, vehicle_number),
           updated_at = NOW()
          WHERE user_id = $4`,
-        [vehicle_type, vehicle_model, vehicle_number, authReq.user.userId]
+        [vehicle_type, vehicle_model, vehicle_number, authReq.user!.id]
       );
     }
 
@@ -246,7 +246,7 @@ router.post("/documents", async (req: Request, res: Response) => {
  */
 router.post("/go-online", requireWalletEligibleRider, async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
-  await db.query("UPDATE rider_profiles SET is_online = true, updated_at = NOW() WHERE user_id = $1", [authReq.user.userId]);
+  await db.query("UPDATE rider_profiles SET is_online = true, updated_at = NOW() WHERE user_id = $1", [authReq.user!.id]);
   return sendSuccess(res, { is_online: true, message: "You are now online." });
 });
 
@@ -255,7 +255,7 @@ router.post("/go-online", requireWalletEligibleRider, async (req: Request, res: 
  */
 router.post("/go-offline", async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
-  await db.query("UPDATE rider_profiles SET is_online = false, updated_at = NOW() WHERE user_id = $1", [authReq.user.userId]);
+  await db.query("UPDATE rider_profiles SET is_online = false, updated_at = NOW() WHERE user_id = $1", [authReq.user!.id]);
   return sendSuccess(res, { is_online: false, message: "You are now offline." });
 });
 
@@ -268,7 +268,7 @@ router.patch("/location", async (req: Request, res: Response) => {
   if (!latitude || !longitude) return sendError(res, "VALIDATION_FAILED", "latitude and longitude required");
 
   // In production, update PostGIS or Redis here. For MVP, we'll log it.
-  await db.query("UPDATE rider_profiles SET last_lat = $1, last_lng = $2, updated_at = NOW() WHERE user_id = $3", [latitude, longitude, authReq.user.userId]);
+  await db.query("UPDATE rider_profiles SET last_lat = $1, last_lng = $2, updated_at = NOW() WHERE user_id = $3", [latitude, longitude, authReq.user!.id]);
   return sendSuccess(res, { message: "Location updated." });
 });
 
@@ -277,7 +277,7 @@ router.patch("/location", async (req: Request, res: Response) => {
  */
 router.get("/status", async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
-  const rows = await db.query("SELECT is_online, is_verified FROM rider_profiles WHERE user_id = $1", [authReq.user.userId]);
+  const rows = await db.query("SELECT is_online, is_verified FROM rider_profiles WHERE user_id = $1", [authReq.user!.id]);
   if (rows.length === 0) return sendError(res, "NOT_FOUND", "Profile missing");
   return sendSuccess(res, rows[0]);
 });
@@ -298,7 +298,7 @@ router.get("/jobs", async (req: Request, res: Response) => {
        WHERE (rb.status = 'requested' AND rb.rider_id IS NULL) 
           OR (rb.rider_id = $1 AND rb.status IN ('assigned', 'arrived', 'in_transit'))
        ORDER BY rb.created_at DESC`,
-      [authReq.user.userId]
+      [authReq.user!.id]
     );
     return sendSuccess(res, { jobs });
   } catch (error: any) {
@@ -323,12 +323,12 @@ router.post("/jobs/:id/accept", requireWalletEligibleRider, async (req: Request,
 
     await db.query(
       "UPDATE ride_bookings SET status = 'assigned', rider_id = $1, updated_at = NOW() WHERE id = $2",
-      [authReq.user.userId, rideId]
+      [authReq.user!.id, rideId]
     );
     await db.query("COMMIT");
 
     const customer = await db.query("SELECT phone FROM users WHERE id = $1", [ride[0].customer_id]);
-    const rider = await db.query("SELECT u.full_name, rp.vehicle_number, rp.vehicle_model FROM users u LEFT JOIN rider_profiles rp ON u.id = rp.user_id WHERE u.id = $1", [authReq.user.userId]);
+    const rider = await db.query("SELECT u.full_name, rp.vehicle_number, rp.vehicle_model FROM users u LEFT JOIN rider_profiles rp ON u.id = rp.user_id WHERE u.id = $1", [authReq.user!.id]);
 
     if (customer.length > 0 && rider.length > 0) {
       await domainNotifier.dispatch(customer[0].phone, "rider_assigned", {
@@ -358,7 +358,7 @@ router.post("/jobs/:id/reject", async (req: Request, res: Response) => {
 router.post("/jobs/:id/arrived", async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
   try {
-    const ride = await db.query("SELECT * FROM ride_bookings WHERE id = $1 AND rider_id = $2", [req.params.id, authReq.user.userId]);
+    const ride = await db.query("SELECT * FROM ride_bookings WHERE id = $1 AND rider_id = $2", [req.params.id, authReq.user!.id]);
     if (ride.length === 0) return sendError(res, "INVALID_JOB", "Job not found or not yours.");
     
     await db.query("UPDATE ride_bookings SET status = 'arrived', updated_at = NOW() WHERE id = $1", [req.params.id]);
@@ -378,7 +378,7 @@ router.post("/jobs/:id/arrived", async (req: Request, res: Response) => {
 router.post("/jobs/:id/start", async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
   try {
-    const ride = await db.query("SELECT * FROM ride_bookings WHERE id = $1 AND rider_id = $2", [req.params.id, authReq.user.userId]);
+    const ride = await db.query("SELECT * FROM ride_bookings WHERE id = $1 AND rider_id = $2", [req.params.id, authReq.user!.id]);
     if (ride.length === 0) return sendError(res, "INVALID_JOB", "Job not found.");
     
     await db.query("UPDATE ride_bookings SET status = 'in_transit', updated_at = NOW() WHERE id = $1", [req.params.id]);
@@ -398,7 +398,7 @@ router.post("/jobs/:id/start", async (req: Request, res: Response) => {
 router.post("/jobs/:id/complete", async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
   try {
-    const ride = await db.query("SELECT * FROM ride_bookings WHERE id = $1 AND rider_id = $2", [req.params.id, authReq.user.userId]);
+    const ride = await db.query("SELECT * FROM ride_bookings WHERE id = $1 AND rider_id = $2", [req.params.id, authReq.user!.id]);
     if (ride.length === 0) return sendError(res, "INVALID_JOB", "Job not found.");
     
     await db.query("UPDATE ride_bookings SET status = 'completed', updated_at = NOW() WHERE id = $1", [req.params.id]);

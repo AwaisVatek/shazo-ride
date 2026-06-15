@@ -64,7 +64,7 @@ class NotificationService {
     const provider = "evolution";
     
     // Fall back to a local console log if mock or unconfigured
-    if (config.EVOLUTION_API_KEY === "demo_evolution_key" || !config.EVOLUTION_API_BASE_URL) {
+    if (config.EVOLUTION_API_KEY === "demo_evolution_key" || !config.EVOLUTION_API_URL) {
       console.log(`[WhatsApp Mock to ${phone}]: ${message}`);
       await this.logDelivery(phone, "whatsapp", provider, "sent", "mock_wa_" + Date.now());
       return { success: true, channel: "whatsapp", provider, externalId: "mock_wa_" + Date.now() };
@@ -73,7 +73,7 @@ class NotificationService {
     try {
       // Clean non-digit characters for WhatsApp API destination
       const digitsOnly = phone.replace(/\D/g, "");
-      const url = `${config.EVOLUTION_API_BASE_URL}/message/sendText/${config.EVOLUTION_INSTANCE_NAME}`;
+      const url = `${config.EVOLUTION_API_URL}/message/sendText/${config.EVOLUTION_INSTANCE_NAME}`;
       
       const payload = {
         number: digitsOnly,

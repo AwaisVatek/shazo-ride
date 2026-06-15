@@ -581,7 +581,7 @@ router.post("/verify-otp", async (req: Request, res: Response) => {
  */
 router.get("/me", requireAuth, async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
-  const userRows = await db.query("SELECT id, full_name, phone, role, profile_completed, avatar_url FROM users WHERE id = $1", [authReq.user.userId]);
+  const userRows = await db.query("SELECT id, full_name, phone, role, profile_completed, avatar_url FROM users WHERE id = $1", [authReq.user!.id]);
   
   if (userRows.length === 0) {
     return sendError(res, "USER_NOT_FOUND", "Authenticated user not found.", 404);
@@ -812,7 +812,7 @@ router.post("/set-password", requireAuth, async (req: Request, res: Response) =>
     const cryptPassword = await bcrypt.hash(password, 10);
     await db.query(
       "UPDATE users SET password_hash = $1, password_set_at = NOW() WHERE id = $2",
-      [cryptPassword, authReq.user.userId]
+      [cryptPassword, authReq.user!.id]
     );
     return sendSuccess(res, { message: "Password updated successfully" });
   } catch (err: any) {

@@ -1,5 +1,8 @@
 import cors from "cors";
 import dotenv from "dotenv";
+import { createServer } from "http";
+import { Server } from "socket.io";
+import crypto from "crypto";
 dotenv.config();
 
 import { app } from "./express_app";
@@ -8,6 +11,58 @@ import { db } from "./db/index";
 import { seed } from "./seed/index";
 
 const PORT = Number(process.env.PORT) || 3000;
+
+export const httpServer = createServer(app);
+export const io = new Server(httpServer, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST", "PATCH"]
+  }
+});
+
+// Setup basic Socket.io events
+io.on("connection", (socket) => {
+  console.log(`🔌 Client connected: ${socket.id}`);
+  
+  // A driver joins a specific room to receive nearby requests
+  socket.on("join_driver_pool", () => {
+    socket.join("driver_pool");
+    console.log(`Driver joined pool: ${socket.id}`);
+  });
+
+  // A customer joins their own room to listen for driver bids
+  socket.on("join_ride", (rideId) => {
+    socket.join(rideId);
+    console.log(`Customer joined ride tracking: ${rideId}`);
+  });
+
+  // Chat message system for an active ride
+  socket.on("send_message", async (data: { rideId: string, senderId: string, senderRole: string, content: string }) => {
+    try {
+      const msgId = "msg_" + crypto.randomUUID().slice(0, 8);
+      await db.query(
+        "INSERT INTO ride_messages (id, ride_id, sender_id, sender_role, content) VALUES ($1, $2, $3, $4, $5)",
+        [msgId, data.rideId, data.senderId, data.senderRole, data.content]
+      );
+      
+      // Broadcast to everyone in the room
+      io.to(data.rideId).emit("receive_message", {
+        id: msgId,
+        ride_id: data.rideId,
+        sender_id: data.senderId,
+        sender_role: data.senderRole,
+        content: data.content,
+        created_at: new Date().toISOString()
+      });
+    } catch (err) {
+      console.error("Chat Error:", err);
+    }
+  });
+
+  socket.on("disconnect", () => {
+    console.log(`🔌 Client disconnected: ${socket.id}`);
+  });
+});
 
 async function bootstrap() {
   // Check if ran as CLI migrations or seeds utility command
@@ -56,10 +111,10 @@ async function bootstrap() {
   }
 
   // 3. Bind server to port
-  app.listen(PORT, "0.0.0.0", () => {
+  httpServer.listen(PORT, "0.0.0.0", () => {
     console.log(`===============================================`);
     console.log(`💚 Shazo Ride Company Core API is fully ONLINE!`);
-    console.log(`📌 Port: ${PORT}`);
+    console.log(`📌 Port: ${PORT} (HTTP + WebSockets)`);
     console.log(`📡 Bind: 0.0.0.0`);
     console.log(`🌍 Env:  ${config.APP_ENV}`);
     console.log(`===============================================`);

@@ -5,6 +5,7 @@ import { sendSuccess, sendError } from "../../utils/response";
 import { config } from "../../config/index";
 import { db } from "../../db/index";
 import { sendWhatsApp } from "../../utils/notify";
+import { io } from "../../server";
 
 const router = Router();
 
@@ -87,17 +88,28 @@ router.post("/estimate", requireAuth, async (req: Request, res: Response) => {
 
     const estimates = activeSettings.map(service => {
       let baseFare = Number(service.base_fare) + (distance_km * Number(service.per_km_rate)) + (duration_minutes * Number(service.per_minute_rate));
-      baseFare = Math.max(baseFare, Number(service.minimum_fare));
-      const finalFare = Math.max(0, baseFare - calcDiscount(baseFare));
+      
+      // Smart Fare Logic: 
+      // Minimum fare is the absolute floor. Recommended fare is the peak-adjusted starting point.
+      const peakFactor = Number(service.peak_factor_multiplier) || 1.0;
+      const recMultiplier = Number(service.recommended_fare_multiplier) || 1.2;
+
+      let minimumFare = Math.max(baseFare, Number(service.minimum_fare));
+      let recommendedFare = minimumFare * peakFactor * recMultiplier;
+      
+      // Apply discounts
+      const finalMinimumFare = Math.max(0, minimumFare - calcDiscount(minimumFare));
+      const finalRecommendedFare = Math.max(0, recommendedFare - calcDiscount(recommendedFare));
       
       return {
         service_type: service.service_type,
         service_name: service.service_name || service.service_type,
-        original_fare: Math.round(baseFare),
-        final_fare: Math.round(finalFare),
-        discount_applied: Math.round(calcDiscount(baseFare)),
+        minimum_fare: Math.round(finalMinimumFare),
+        recommended_fare: Math.round(finalRecommendedFare),
+        total_fare: Math.round(finalRecommendedFare), // Legacy compat
+        discount_applied: Math.round(calcDiscount(recommendedFare)),
         currency: config.DEFAULT_CURRENCY,
-        pilot_commission: config.FREE_COMMISSION_ENABLED ? 0 : Math.round(baseFare * (Number(service.commission_percentage) / 100))
+        pilot_commission: config.FREE_COMMISSION_ENABLED ? 0 : Math.round(finalRecommendedFare * (Number(service.commission_percentage) / 100))
       };
     });
 
@@ -198,6 +210,9 @@ router.post("/book", requireAuth, async (req: AuthenticatedRequest, res: Respons
 
     const fullBooking = await db.query("SELECT * FROM ride_bookings WHERE id = $1", [rideId]);
 
+    // Broadcast new ride to all drivers
+    io.to("driver_pool").emit("new_ride_request", fullBooking[0]);
+
     return sendSuccess(res, { ride: fullBooking[0] }, 201);
 
   } catch (err: any) {
@@ -233,10 +248,34 @@ router.post("/offer-fare", requireAuth, async (req: AuthenticatedRequest, res: R
       [offerId, ride_id, req.user!.role, req.user!.id, proposed_fare]
     );
 
+    // Alert the customer that a driver proposed a bid
+    io.to(ride_id).emit("new_driver_offer", {
+      offerId,
+      proposed_fare,
+      driver: { id: req.user!.id, name: req.user!.full_name, rating: 4.8 } // Mock rating
+    });
+
     return sendSuccess(res, { offerId, message: "Bidding transaction compiled successfully." }, 201);
 
   } catch (err: any) {
-    return sendError(res, "OFFER_FARE_FAILED", err.message, 500);
+    return sendError(res, "OFFER_CREATION_FAILED", err.message, 500);
+  }
+});
+
+/**
+ * GET /:id/messages
+ * Retrieves the chat history for a specific ride
+ */
+router.get("/:id/messages", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const messages = await db.query(
+      "SELECT * FROM ride_messages WHERE ride_id = $1 ORDER BY created_at ASC",
+      [id]
+    );
+    return sendSuccess(res, { messages });
+  } catch (err: any) {
+    return sendError(res, "FETCH_MESSAGES_FAILED", err.message, 500);
   }
 });
 

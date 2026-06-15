@@ -24,7 +24,7 @@ router.get("/me", async (req: Request, res: Response) => {
        FROM users u
        LEFT JOIN customer_profiles cp ON u.id = cp.user_id
        WHERE u.id = $1`,
-      [authReq.user.userId]
+      [authReq.user!.id]
     );
 
     if (userRows.length === 0) {
@@ -63,7 +63,7 @@ router.patch("/me", async (req: Request, res: Response) => {
           profile_completed = true,
           updated_at = NOW()
          WHERE id = $4`,
-        [full_name, email, profile_image_url, authReq.user.userId]
+        [full_name, email, profile_image_url, authReq.user!.id]
       );
     }
 
@@ -76,7 +76,7 @@ router.patch("/me", async (req: Request, res: Response) => {
           emergency_contact_phone = COALESCE($3, emergency_contact_phone),
           updated_at = NOW()
          WHERE user_id = $4`,
-        [default_city, emergency_contact_name, emergency_contact_phone, authReq.user.userId]
+        [default_city, emergency_contact_name, emergency_contact_phone, authReq.user!.id]
       );
     }
 
@@ -88,7 +88,7 @@ router.patch("/me", async (req: Request, res: Response) => {
        FROM users u
        LEFT JOIN customer_profiles cp ON u.id = cp.user_id
        WHERE u.id = $1`,
-      [authReq.user.userId]
+      [authReq.user!.id]
     );
 
     return sendSuccess(res, { profile: updatedProfile[0] });
@@ -107,7 +107,7 @@ router.get("/rides", async (req: Request, res: Response) => {
   try {
     const rides = await db.query(
       "SELECT * FROM ride_bookings WHERE customer_id = $1 ORDER BY created_at DESC LIMIT 50",
-      [authReq.user.userId]
+      [authReq.user!.id]
     );
     return sendSuccess(res, { rides });
   } catch (err: any) {
@@ -155,7 +155,7 @@ router.post("/food/order", async (req: Request, res: Response) => {
     await db.query(
       `INSERT INTO food_orders (id, customer_id, restaurant_id, delivery_address, delivery_lat, delivery_lng, total_amount, status)
        VALUES ($1, $2, $3, $4, $5, $6, $7, 'ordered')`,
-      [orderId, authReq.user.userId, restaurant_id, delivery_address, delivery_lat, delivery_lng, total_amount]
+      [orderId, authReq.user!.id, restaurant_id, delivery_address, delivery_lat, delivery_lng, total_amount]
     );
     return sendSuccess(res, { message: "Order placed successfully.", order_id: orderId });
   } catch (err: any) {
@@ -178,7 +178,7 @@ router.post("/ambulance/request", async (req: Request, res: Response) => {
     await db.query(
       `INSERT INTO ambulance_bookings (id, customer_id, pickup_address, pickup_lat, pickup_lng, emergency_type, patient_condition, status)
        VALUES ($1, $2, $3, $4, $5, $6, $7, 'requested')`,
-      [bookingId, authReq.user.userId, pickup_address, pickup_lat, pickup_lng, emergency_type, patient_condition]
+      [bookingId, authReq.user!.id, pickup_address, pickup_lat, pickup_lng, emergency_type, patient_condition]
     );
     return sendSuccess(res, { message: "Ambulance requested successfully. Help is on the way.", booking_id: bookingId });
   } catch (err: any) {
@@ -195,13 +195,13 @@ router.get("/wallet", async (req: Request, res: Response) => {
   try {
     const transactions = await db.query(
       "SELECT * FROM ledger_transactions WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50",
-      [authReq.user.userId]
+      [authReq.user!.id]
     );
     
     // Calculate current balance
     const balanceResult = await db.query(
       "SELECT SUM(amount) as balance FROM ledger_transactions WHERE user_id = $1",
-      [authReq.user.userId]
+      [authReq.user!.id]
     );
     
     const balance = balanceResult[0]?.balance || 0;
@@ -225,7 +225,7 @@ router.post("/wallet/topup", async (req: Request, res: Response) => {
     await db.query(
       `INSERT INTO ledger_transactions (id, user_id, transaction_type, amount, currency, status, reference_id, metadata)
        VALUES ($1, $2, 'topup', $3, 'PKR', 'completed', $4, $5)`,
-      [txId, authReq.user.userId, amount, reference_id || null, { payment_method }]
+      [txId, authReq.user!.id, amount, reference_id || null, { payment_method }]
     );
     return sendSuccess(res, { message: "Wallet topped up successfully.", transaction_id: txId, amount_added: amount });
   } catch (err: any) {
