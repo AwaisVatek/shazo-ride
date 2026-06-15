@@ -594,10 +594,10 @@ router.get("/me", requireAuth, async (req: Request, res: Response) => {
  * POST /api/auth/signup-password
  */
 router.post("/signup-password", async (req: Request, res: Response) => {
-  const { full_name, phone, password, default_city, email } = req.body;
+  const { full_name, phone, password, default_city, email, username } = req.body;
 
-  if (!full_name || !phone || !password) {
-    return sendError(res, "VALIDATION_FAILED", "Full name, phone, and password are required.");
+  if (!full_name || !phone || !password || !username) {
+    return sendError(res, "VALIDATION_FAILED", "Full name, username, phone, and password are required.");
   }
 
   if (password.length < 8 || !/[a-zA-Z]/.test(password) || !/[0-9]/.test(password)) {
@@ -619,10 +619,19 @@ router.post("/signup-password", async (req: Request, res: Response) => {
     const userId = "usr_" + crypto.randomUUID().slice(0, 8);
     const userEmail = email ? email.toLowerCase().trim() : `${target.replace('+', '')}@shazo-otp.com`;
 
+    const finalUsername = username ? username.toLowerCase().trim() : null;
+
+    if (finalUsername) {
+      const usernameExists = await db.query("SELECT id FROM users WHERE username = $1", [finalUsername]);
+      if (usernameExists.length > 0) {
+        return sendError(res, "CONFLICT", "This username is already taken.", 409);
+      }
+    }
+
     await db.query(
-      `INSERT INTO users (id, full_name, email, phone, role, is_verified, password_hash, avatar_url, password_set_at)
-       VALUES ($1, $2, $3, $4, 'customer', false, $5, $6, NOW())`,
-      [userId, full_name, userEmail, target, cryptPassword, `https://api.dicebear.com/7.x/initials/svg?seed=${full_name}`]
+      `INSERT INTO users (id, full_name, email, phone, role, is_verified, password_hash, avatar_url, password_set_at, username)
+       VALUES ($1, $2, $3, $4, 'customer', false, $5, $6, NOW(), $7)`,
+      [userId, full_name, userEmail, target, cryptPassword, `https://api.dicebear.com/7.x/initials/svg?seed=${full_name}`, finalUsername]
     );
 
     await db.query(
@@ -730,12 +739,20 @@ router.post("/login-password", async (req: Request, res: Response) => {
     return sendError(res, "VALIDATION_FAILED", "Both phone and password are required.");
   }
 
-  const target = normalizePakistanPhone(phone);
+  const rawIdentifier = phone.trim().toLowerCase();
+  const isPhoneNumber = /^[0-9+]+$/.test(rawIdentifier);
+  const target = isPhoneNumber ? normalizePakistanPhone(rawIdentifier) : rawIdentifier;
 
   try {
-    const userRows = await db.query("SELECT * FROM users WHERE phone = $1", [target]);
+    let userRows;
+    if (isPhoneNumber) {
+      userRows = await db.query("SELECT * FROM users WHERE phone = $1", [target]);
+    } else {
+      userRows = await db.query("SELECT * FROM users WHERE username = $1", [target]);
+    }
+    
     if (userRows.length === 0) {
-      return sendError(res, "INVALID_CREDENTIALS", "Incorrect phone number or password.", 401);
+      return sendError(res, "INVALID_CREDENTIALS", "Incorrect credentials.", 401);
     }
 
     const matchedUser = userRows[0];
