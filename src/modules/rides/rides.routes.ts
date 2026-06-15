@@ -169,23 +169,30 @@ router.post("/book", requireAuth, async (req: AuthenticatedRequest, res: Respons
 
     // 3. Compute proper fare from defaults or honor user's proposed bid
     let fare = proposed_fare ? Number(proposed_fare) : 150;
+    let min_fare = 0;
     
-    if (!proposed_fare) {
-      const estResponse = await fetch(`${config.API_BASE_URL}/api/rides/estimate`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": req.headers.authorization!
-        },
-        body: JSON.stringify({ pickup_lat, pickup_lng, dropoff_lat, dropoff_lng, promo_code })
-      });
-      if (estResponse.ok) {
-        const estJson: any = await estResponse.json();
-        if (estJson.ok) {
-          const match = estJson.data.estimates.find((e: any) => e.service_type === ride_type);
-          if (match) fare = match.final_fare;
+    const estResponse = await fetch(`${config.API_BASE_URL}/api/rides/estimate`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": req.headers.authorization!
+      },
+      body: JSON.stringify({ pickup_lat, pickup_lng, dropoff_lat, dropoff_lng, promo_code })
+    });
+
+    if (estResponse.ok) {
+      const estJson: any = await estResponse.json();
+      if (estJson.ok) {
+        const match = estJson.data.estimates.find((e: any) => e.service_type === ride_type);
+        if (match) {
+          min_fare = match.minimum_fare;
+          if (!proposed_fare) fare = match.recommended_fare;
         }
       }
+    }
+
+    if (fare < min_fare) {
+      return sendError(res, "FARE_TOO_LOW", `The minimum allowed fare for this route is ${config.DEFAULT_CURRENCY} ${min_fare}.`, 400);
     }
 
     // Determine platform commission (Honor Pakistan pilot 0% Commission campaign checks)
@@ -196,9 +203,9 @@ router.post("/book", requireAuth, async (req: AuthenticatedRequest, res: Respons
     // 4. Save to Database
     const rideId = "rid_" + crypto.randomUUID().slice(0, 8);
     await db.query(
-      `INSERT INTO ride_bookings (id, customer_id, pickup_address, pickup_lat, pickup_lng, dropoff_address, dropoff_lat, dropoff_lng, distance_km, duration_minutes, ride_type, fare, commission_amount, payment_method, promo_code_used, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'requested')`,
-      [rideId, req.user!.id, pickup_address, pickup_lat, pickup_lng, dropoff_address, dropoff_lat, dropoff_lng, distance_km, duration_minutes, ride_type, fare, commission, payment_method || "cash", promo_code || null]
+      `INSERT INTO ride_bookings (id, customer_id, pickup_address, pickup_lat, pickup_lng, dropoff_address, dropoff_lat, dropoff_lng, distance_km, duration_minutes, ride_type, fare, minimum_fare, commission_amount, payment_method, promo_code_used, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'requested')`,
+      [rideId, req.user!.id, pickup_address, pickup_lat, pickup_lng, dropoff_address, dropoff_lat, dropoff_lng, distance_km, duration_minutes, ride_type, fare, min_fare, commission, payment_method || "cash", promo_code || null]
     );
 
     // Initial status logs trail
@@ -231,7 +238,7 @@ router.post("/offer-fare", requireAuth, async (req: AuthenticatedRequest, res: R
   }
 
   try {
-    const rides = await db.query("SELECT status FROM ride_bookings WHERE id = $1", [ride_id]);
+    const rides = await db.query("SELECT status, minimum_fare FROM ride_bookings WHERE id = $1", [ride_id]);
     if (rides.length === 0) {
       return sendError(res, "RIDE_NOT_FOUND", "No ride matches this transaction.", 404);
     }
@@ -240,12 +247,17 @@ router.post("/offer-fare", requireAuth, async (req: AuthenticatedRequest, res: R
       return sendError(res, "INVALID_STATE", "Bidding operations are only active on unassigned pending ride requests.", 400);
     }
 
+    if (Number(proposed_fare) < Number(rides[0].minimum_fare)) {
+      return sendError(res, "FARE_TOO_LOW", `The minimum allowed fare for this route is ${config.DEFAULT_CURRENCY} ${rides[0].minimum_fare}.`, 400);
+    }
+
     // Save bid offer row
     const offerId = "off_" + crypto.randomUUID().slice(0, 8);
+    const isCounter = req.user!.role === "customer";
     await db.query(
-      `INSERT INTO ride_offers (id, ride_id, by_role, offerer_id, proposed_fare, status)
-       VALUES ($1, $2, $3, $4, $5, 'pending')`,
-      [offerId, ride_id, req.user!.role, req.user!.id, proposed_fare]
+      `INSERT INTO ride_offers (id, ride_id, by_role, offerer_id, proposed_fare, status, is_counter_offer)
+       VALUES ($1, $2, $3, $4, $5, 'pending', $6)`,
+      [offerId, ride_id, req.user!.role, req.user!.id, proposed_fare, isCounter]
     );
 
     // Alert the customer that a driver proposed a bid
