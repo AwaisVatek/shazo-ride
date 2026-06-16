@@ -594,7 +594,7 @@ router.get("/me", requireAuth, async (req: Request, res: Response) => {
  * POST /api/auth/signup-password
  */
 router.post("/signup-password", async (req: Request, res: Response) => {
-  const { full_name, phone, password, default_city, email, username } = req.body;
+  const { full_name, phone, password, default_city, email, username, role = "customer" } = req.body;
 
   if (!full_name || !phone || !password || !username) {
     return sendError(res, "VALIDATION_FAILED", "Full name, username, phone, and password are required.");
@@ -602,6 +602,10 @@ router.post("/signup-password", async (req: Request, res: Response) => {
 
   if (password.length < 8 || !/[a-zA-Z]/.test(password) || !/[0-9]/.test(password)) {
     return sendError(res, "WEAK_PASSWORD", "Password must be at least 8 characters long, with at least one letter and one number.");
+  }
+
+  if (!["customer", "rider"].includes(role)) {
+    return sendError(res, "VALIDATION_FAILED", "Invalid role specified.");
   }
 
   const target = normalizePakistanPhone(phone);
@@ -630,8 +634,8 @@ router.post("/signup-password", async (req: Request, res: Response) => {
 
     await db.query(
       `INSERT INTO users (id, full_name, email, phone, role, is_verified, password_hash, avatar_url, password_set_at, username)
-       VALUES ($1, $2, $3, $4, 'customer', false, $5, $6, NOW(), $7)`,
-      [userId, full_name, userEmail, target, cryptPassword, `https://api.dicebear.com/7.x/initials/svg?seed=${full_name}`, finalUsername]
+       VALUES ($1, $2, $3, $4, $5, false, $6, $7, NOW(), $8)`,
+      [userId, full_name, userEmail, target, role, cryptPassword, `https://api.dicebear.com/7.x/initials/svg?seed=${full_name}`, finalUsername]
     );
 
     await db.query(
@@ -640,10 +644,15 @@ router.post("/signup-password", async (req: Request, res: Response) => {
       ["auth_" + crypto.randomUUID().slice(0, 8), userId, target]
     );
 
-    await db.query(
-      `INSERT INTO customer_profiles (user_id, default_city) VALUES ($1, $2)`, 
-      [userId, default_city || null]
-    );
+    if (role === "customer") {
+      await db.query(
+        `INSERT INTO customer_profiles (user_id, default_city) VALUES ($1, $2)`, 
+        [userId, default_city || null]
+      );
+    } else if (role === "rider") {
+      await db.query(`INSERT INTO rider_profiles (user_id) VALUES ($1)`, [userId]);
+      await db.query(`INSERT INTO rider_wallets (rider_id, balance) VALUES ($1, 0)`, [userId]);
+    }
 
     // Send OTP
     const rawPin = Math.floor(Math.pow(10, config.OTP_CODE_LENGTH - 1) + Math.random() * 9 * Math.pow(10, config.OTP_CODE_LENGTH - 1)).toString();
