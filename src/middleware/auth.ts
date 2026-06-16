@@ -111,7 +111,7 @@ export async function requireVerifiedRider(req: Request, res: Response, next: Ne
     }
 
     const { verification_status } = profiles[0];
-    if (verification_status !== "verified") {
+    if (verification_status !== "verified" && verification_status !== "approved") {
       return sendError(res, "RIDER_UNVERIFIED", "Access denied. Your Shazo pilot registration is currently pending documentation audits.", 403);
     }
 

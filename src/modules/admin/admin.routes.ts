@@ -178,7 +178,8 @@ router.get("/riders/:id/details", async (req: AuthenticatedRequest, res: Respons
 
 router.patch("/riders/:id", async (req: AuthenticatedRequest, res: Response) => {
   const status = String(req.body?.status || "pending");
-  await safeRows("update rider", "UPDATE rider_profiles SET verification_status = $1, updated_at = NOW() WHERE user_id = $2", [status, req.params.id]);
+  const rejectionReason = req.body?.rejection_reason || null;
+  await safeRows("update rider", "UPDATE rider_profiles SET verification_status = $1, rejection_reason = $2, updated_at = NOW() WHERE user_id = $3", [status, rejectionReason, req.params.id]);
   await safeRows("verify rider user", "UPDATE users SET is_verified = $1, updated_at = NOW() WHERE id = $2 AND role = 'rider'", [status === "verified", req.params.id]);
   return sendSuccess(res, okMessage("Rider updated."));
 });

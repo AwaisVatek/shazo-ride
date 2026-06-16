@@ -437,20 +437,20 @@ router.get("/vehicle", async (req: Request, res: Response) => {
  */
 router.post("/vehicle", async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
-  const { make_model, color, license_plate, year, vehicle_category, registration_number, ownership_status } = req.body;
+  const { make_model, color, license_plate, year, vehicle_category, registration_number, ownership_status, registration_document_url, vehicle_images } = req.body;
   try {
     const existing = await db.query("SELECT id FROM rider_vehicles WHERE rider_id = $1", [authReq.user!.id]);
     if (existing.length > 0) {
       await db.query(
-        `UPDATE rider_vehicles SET make_model=$1, color=$2, license_plate=$3, year=$4, vehicle_category=$5, registration_number=$6, ownership_status=$7, verification_status='pending' WHERE rider_id=$8`,
-        [make_model, color, license_plate, year, vehicle_category, registration_number, ownership_status, authReq.user!.id]
+        `UPDATE rider_vehicles SET make_model=$1, color=$2, license_plate=$3, year=$4, vehicle_category=$5, registration_number=$6, ownership_status=$7, registration_document_url=COALESCE($8, registration_document_url), vehicle_images=COALESCE($9, vehicle_images), verification_status='pending' WHERE rider_id=$10`,
+        [make_model, color, license_plate, year, vehicle_category, registration_number, ownership_status, registration_document_url, vehicle_images, authReq.user!.id]
       );
     } else {
       const vid = "veh_" + Math.random().toString(36).substring(2, 10);
       await db.query(
-        `INSERT INTO rider_vehicles (id, rider_id, make_model, color, license_plate, year, vehicle_category, registration_number, ownership_status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-        [vid, authReq.user!.id, make_model, color, license_plate, year, vehicle_category, registration_number, ownership_status]
+        `INSERT INTO rider_vehicles (id, rider_id, make_model, color, license_plate, year, vehicle_category, registration_number, ownership_status, registration_document_url, vehicle_images)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        [vid, authReq.user!.id, make_model, color, license_plate, year, vehicle_category, registration_number, ownership_status, registration_document_url, vehicle_images]
       );
     }
     return sendSuccess(res, { message: "Vehicle details updated successfully." });
