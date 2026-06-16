@@ -602,8 +602,8 @@ router.get("/me", requireAuth, async (req: Request, res: Response) => {
 router.post("/signup-password", async (req: Request, res: Response) => {
   const { full_name, phone, password, default_city, email, username, role = "customer" } = req.body;
 
-  if (!full_name || !phone || !password || !username) {
-    return sendError(res, "VALIDATION_FAILED", "Full name, username, phone, and password are required.");
+  if (!full_name || !phone || !password) {
+    return sendError(res, "VALIDATION_FAILED", "Full name, phone, and password are required.");
   }
 
   if (password.length < 8 || !/[a-zA-Z]/.test(password) || !/[0-9]/.test(password)) {
@@ -630,14 +630,12 @@ router.post("/signup-password", async (req: Request, res: Response) => {
     const cryptPassword = await bcrypt.hash(password, 10);
     const userId = "usr_" + crypto.randomUUID().slice(0, 8);
     const userEmail = email ? email.toLowerCase().trim() : `${target.replace('+', '')}@shazo-otp.com`;
-    const finalUsername = username ? username.toLowerCase().trim() : null;
+    const finalUsername = username ? username.toLowerCase().trim() : `${role}_${target.replace(/[^0-9]/g, '')}`;
 
-    if (finalUsername) {
-      console.log("[SIGNUP] Checking username");
-      const usernameExists = await db.query("SELECT id FROM users WHERE username = $1", [finalUsername]);
-      if (usernameExists.length > 0) {
-        return sendError(res, "CONFLICT", "This username is already taken.", 409);
-      }
+    console.log("[SIGNUP] Checking username");
+    const usernameExists = await db.query("SELECT id FROM users WHERE username = $1", [finalUsername]);
+    if (usernameExists.length > 0) {
+      return sendError(res, "CONFLICT", "This username is already taken.", 409);
     }
 
     console.log("[SIGNUP] Inserting user");
@@ -680,7 +678,7 @@ router.post("/signup-password", async (req: Request, res: Response) => {
         const walletId = "wal_" + crypto.randomUUID().slice(0, 8);
         await client.query(
           `INSERT INTO rider_wallets (id, rider_id, balance) VALUES ($1, $2, 0)`,
-          [walletId, userId]
+          [walletId, riderProfId]
         );
       }
 
@@ -754,9 +752,28 @@ router.post("/signup-password", async (req: Request, res: Response) => {
       }
     }
 
+    const token = jwt.sign(
+      { userId: userId, role: role },
+      config.JWT_SECRET,
+      { expiresIn: "30d" }
+    );
+
+    const sessionId = "ses_" + crypto.randomUUID().slice(0, 8);
+    await db.query(
+      `INSERT INTO sessions (id, user_id, role, token, expires_at)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [sessionId, userId, role, token, new Date(Date.now() + 30 * 24 * 3600000)]
+    );
+
     return sendSuccess(res, {
-      message: "Signup successful, OTP sent",
-      expiresInMinutes: config.OTP_EXPIRY_MINUTES
+      message: "Signup successful",
+      token,
+      user: {
+        id: userId,
+        phone: target,
+        role: role,
+        profile_completed: false
+      }
     }, 201);
 
   } catch (err: any) {
