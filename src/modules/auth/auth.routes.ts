@@ -248,7 +248,8 @@ router.post("/email/signup", async (req: Request, res: Response) => {
       ["auth_" + crypto.randomUUID().slice(0, 8), userId, email.toLowerCase().trim()]
     );
 
-    await db.query("INSERT INTO customer_profiles (user_id) VALUES ($1)", [userId]);
+    const custProfId = "cpr_" + crypto.randomUUID().slice(0, 8);
+    await db.query("INSERT INTO customer_profiles (id, user_id) VALUES ($1, $2)", [custProfId, userId]);
 
     return sendSuccess(res, {
       message: "Registration completed successfully. Welcome to Shazo!",
@@ -256,7 +257,8 @@ router.post("/email/signup", async (req: Request, res: Response) => {
     }, 201);
 
   } catch (err: any) {
-    return sendError(res, "SIGNUP_FAILED", err.message, 500);
+    console.error("[SIGNUP_PASSWORD_ERROR]", err);
+    return sendError(res, "SIGNUP_FAILED", err && err.message ? String(err.message) : String(err), 500);
   }
 });
 
@@ -534,7 +536,11 @@ router.post("/verify-otp", async (req: Request, res: Response) => {
       );
 
       if (role === "customer") {
-        await db.query("INSERT INTO customer_profiles (user_id) VALUES ($1)", [newId]);
+        const custProfId = "cpr_" + crypto.randomUUID().slice(0, 8);
+        await db.query(
+          `INSERT INTO customer_profiles (id, user_id) VALUES ($1, $2)`, 
+          [custProfId, newId]
+        );
       } else if (role === "rider") {
         await db.query("INSERT INTO rider_profiles (user_id) VALUES ($1)", [newId]);
         await db.query("INSERT INTO rider_wallets (rider_id, balance) VALUES ($1, 0)", [newId]);
@@ -614,57 +620,77 @@ router.post("/signup-password", async (req: Request, res: Response) => {
   }
 
   try {
+    console.log("[SIGNUP] Start", target);
     const existing = await db.query("SELECT id FROM users WHERE phone = $1", [target]);
     if (existing.length > 0) {
       return sendError(res, "CONFLICT", "An account matching this phone number is already registered.", 409);
     }
 
+    console.log("[SIGNUP] Hashing password");
     const cryptPassword = await bcrypt.hash(password, 10);
     const userId = "usr_" + crypto.randomUUID().slice(0, 8);
     const userEmail = email ? email.toLowerCase().trim() : `${target.replace('+', '')}@shazo-otp.com`;
-
     const finalUsername = username ? username.toLowerCase().trim() : null;
 
     if (finalUsername) {
+      console.log("[SIGNUP] Checking username");
       const usernameExists = await db.query("SELECT id FROM users WHERE username = $1", [finalUsername]);
       if (usernameExists.length > 0) {
         return sendError(res, "CONFLICT", "This username is already taken.", 409);
       }
     }
 
-    await db.query(
-      `INSERT INTO users (id, full_name, email, phone, role, is_verified, password_hash, avatar_url, password_set_at, username)
-       VALUES ($1, $2, $3, $4, $5, false, $6, $7, NOW(), $8)`,
-      [userId, full_name, userEmail, target, role, cryptPassword, `https://api.dicebear.com/7.x/initials/svg?seed=${full_name}`, finalUsername]
-    );
-
-    await db.query(
-      `INSERT INTO auth_accounts (id, user_id, provider, provider_user_id)
-       VALUES ($1, $2, 'phone_password', $3)`,
-      ["auth_" + crypto.randomUUID().slice(0, 8), userId, target]
-    );
-
-    if (role === "customer") {
-      await db.query(
-        `INSERT INTO customer_profiles (user_id, default_city) VALUES ($1, $2)`, 
-        [userId, default_city || null]
-      );
-    } else if (role === "rider") {
-      await db.query(`INSERT INTO rider_profiles (user_id) VALUES ($1)`, [userId]);
-      await db.query(`INSERT INTO rider_wallets (rider_id, balance) VALUES ($1, 0)`, [userId]);
-    }
-
-    // Send OTP
+    console.log("[SIGNUP] Inserting user");
+    console.log("[SIGNUP] Preparing OTP payload");
     const rawPin = Math.floor(Math.pow(10, config.OTP_CODE_LENGTH - 1) + Math.random() * 9 * Math.pow(10, config.OTP_CODE_LENGTH - 1)).toString();
     const pinHash = await bcrypt.hash(rawPin, 10);
     const expiresAt = new Date(Date.now() + config.OTP_EXPIRY_MINUTES * 60000);
     const otpId = "vfn_" + crypto.randomUUID().slice(0, 8);
 
-    await db.query(
-      `INSERT INTO otp_verifications (id, phone, normalized_phone, role, otp_hash, max_attempts, expires_at)
-       VALUES ($1, $2, $3, 'customer', $4, $5, $6)`,
-      [otpId, phone, target, pinHash, config.OTP_MAX_ATTEMPTS, expiresAt]
-    );
+    await db.transaction(async (client) => {
+      console.log("[SIGNUP] Inserting user");
+      await client.query(
+        `INSERT INTO users (id, full_name, email, phone, role, is_verified, password_hash, avatar_url, password_set_at, username)
+         VALUES ($1, $2, $3, $4, $5, false, $6, $7, NOW(), $8)`,
+        [userId, full_name, userEmail, target, role, cryptPassword, `https://api.dicebear.com/7.x/initials/svg?seed=${full_name}`, finalUsername]
+      );
+
+      console.log("[SIGNUP] Inserting auth_accounts");
+      await client.query(
+        `INSERT INTO auth_accounts (id, user_id, provider, provider_user_id)
+         VALUES ($1, $2, 'phone_password', $3)`,
+        ["auth_" + crypto.randomUUID().slice(0, 8), userId, target]
+      );
+
+      if (role === "customer") {
+        console.log("[SIGNUP] Inserting customer_profiles");
+        const custProfId = "cpr_" + crypto.randomUUID().slice(0, 8);
+        await client.query(
+          `INSERT INTO customer_profiles (id, user_id, default_city) VALUES ($1, $2, $3)`, 
+          [custProfId, userId, default_city || null]
+        );
+      } else if (role === "rider") {
+        console.log("[SIGNUP] Inserting rider_profiles");
+        const riderProfId = "rpr_" + crypto.randomUUID().slice(0, 8);
+        await client.query(
+          `INSERT INTO rider_profiles (id, user_id, vehicle_type, default_city) VALUES ($1, $2, $3, $4)`,
+          [riderProfId, userId, null, default_city || null]
+        );
+        console.log("[SIGNUP] Inserting rider_wallets");
+        const walletId = "wal_" + crypto.randomUUID().slice(0, 8);
+        await client.query(
+          `INSERT INTO rider_wallets (id, rider_id, balance) VALUES ($1, $2, 0)`,
+          [walletId, userId]
+        );
+      }
+
+      console.log("[SIGNUP] Inserting otp_verifications");
+      await client.query(
+        `INSERT INTO otp_verifications (id, phone, normalized_phone, role, otp_hash, max_attempts, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [otpId, phone, target, role, pinHash, config.OTP_MAX_ATTEMPTS, expiresAt]
+      );
+    });
 
     if (!config.OTP_BYPASS_ENABLED) {
       if (config.N8N_OTP_WEBHOOK_URL) {
@@ -678,7 +704,7 @@ router.post("/signup-password", async (req: Request, res: Response) => {
             phone: target, 
             normalized_phone: target,
             otp: rawPin, 
-            role: "customer",
+            role: role,
             purpose: "signup",
             message: `Your Shazo Ride verification code is ${rawPin}. This code will expire in ${config.OTP_EXPIRY_MINUTES} minutes. Do not share it with anyone.`,
             expires_in_minutes: config.OTP_EXPIRY_MINUTES,
@@ -734,7 +760,8 @@ router.post("/signup-password", async (req: Request, res: Response) => {
     }, 201);
 
   } catch (err: any) {
-    return sendError(res, "SIGNUP_FAILED", err.message, 500);
+    console.error("[SIGNUP_PASSWORD_ERROR]", err);
+    return sendError(res, "SIGNUP_FAILED", err && err.message ? String(err.message) : String(err), 500);
   }
 });
 

@@ -1,0 +1,2 @@
+ALTER TABLE auth_accounts DROP CONSTRAINT IF EXISTS auth_accounts_provider_check;
+ALTER TABLE auth_accounts ADD CONSTRAINT auth_accounts_provider_check CHECK (provider IN ('email', 'phone_otp', 'phone_password', 'google', 'facebook', 'apple'));
