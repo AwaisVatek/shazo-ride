@@ -133,32 +133,47 @@ router.get("/riders", async (req: AuthenticatedRequest, res: Response) => {
 
       rp.id AS rider_profile_id,
       rp.verification_status,
-      rp.vehicle_type,
-      rp.vehicle_make,
-      rp.vehicle_model,
-      rp.vehicle_plate,
-      rp.vehicle_number,
+      COALESCE(rv.vehicle_category, rp.vehicle_type) AS vehicle_type,
+      SPLIT_PART(rv.make_model, ' ', 1) AS vehicle_make,
+      rv.make_model AS vehicle_model,
+      rv.license_plate AS vehicle_plate,
+      rv.registration_number AS vehicle_number,
       rp.is_online,
-      rp.current_lat,
-      rp.current_lat AS latitude,
-      rp.current_lng,
-      rp.current_lng AS longitude,
-      rp.last_location_at,
-      rp.last_location_at AS last_location_update,
-      rp.rating,
-      rp.total_rides,
+      rp.latitude,
+      rp.latitude AS current_lat,
+      rp.longitude,
+      rp.longitude AS current_lng,
+      rp.last_location_update,
+      rp.last_location_update AS last_location_at,
+      COALESCE(rp.rating, 5.0) AS rating,
+      COALESCE(rp.completed_rides_count, 0) AS total_rides,
 
       COALESCE(rw.balance, 0) AS balance,
       COALESCE(rw.balance, 0) AS wallet_balance
     FROM users u
     LEFT JOIN rider_profiles rp ON rp.user_id = u.id
-    LEFT JOIN rider_wallets rw ON rw.rider_id = rp.id
+    LEFT JOIN rider_vehicles rv ON rv.rider_id = u.id
+    LEFT JOIN rider_wallets rw ON rw.rider_id = u.id
     WHERE u.role = 'rider'
     ORDER BY u.created_at DESC
     LIMIT 100
   `);
 
   return sendSuccess(res, listResponse(items));
+});
+
+router.get("/riders/:id/details", async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const documents = await db.query("SELECT * FROM rider_documents WHERE rider_id = $1", [req.params.id]);
+    const vehicles = await db.query("SELECT * FROM rider_vehicles WHERE rider_id = $1", [req.params.id]);
+    
+    return sendSuccess(res, { 
+      documents: documents,
+      vehicle: vehicles[0] || null 
+    });
+  } catch (error: any) {
+    return sendError(res, "FETCH_FAILED", error.message);
+  }
 });
 
 router.patch("/riders/:id", async (req: AuthenticatedRequest, res: Response) => {
@@ -792,6 +807,40 @@ router.post("/integrations/whatsapp/test-send", async (req: Request, res: Respon
     });
   } catch (err: any) {
     return sendError(res, "SEND_FAILED", err.message, 500);
+  }
+});
+
+/**
+ * PUT /api/admin/riders/:id/vehicle
+ * Admin approves/rejects a vehicle
+ */
+router.put("/riders/:id/vehicle", async (req: AuthenticatedRequest, res: Response) => {
+  const { status, rejection_reason } = req.body;
+  try {
+    await db.query(
+      "UPDATE rider_vehicles SET verification_status = $1, rejection_reason = $2 WHERE rider_id = $3",
+      [status, rejection_reason || null, req.params.id]
+    );
+    return sendSuccess(res, { message: "Vehicle status updated." });
+  } catch (error: any) {
+    return sendError(res, "UPDATE_FAILED", error.message);
+  }
+});
+
+/**
+ * PUT /api/admin/riders/:id/documents/:doc_id
+ * Admin approves/rejects a specific document
+ */
+router.put("/riders/:id/documents/:doc_id", async (req: AuthenticatedRequest, res: Response) => {
+  const { status, rejection_reason } = req.body;
+  try {
+    await db.query(
+      "UPDATE rider_documents SET status = $1, rejection_reason = $2 WHERE id = $3 AND rider_id = $4",
+      [status, rejection_reason || null, req.params.doc_id, req.params.id]
+    );
+    return sendSuccess(res, { message: "Document status updated." });
+  } catch (error: any) {
+    return sendError(res, "UPDATE_FAILED", error.message);
   }
 });
 

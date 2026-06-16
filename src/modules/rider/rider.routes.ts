@@ -1,6 +1,6 @@
 import { Router, Request, Response } from "express";
 import crypto from "crypto";
-import { requireAuth, requireRider, requireWalletEligibleRider, AuthenticatedRequest } from "../../middleware/auth";
+import { requireAuth, requireRider, requireWalletEligibleRider, requireVerifiedRider, AuthenticatedRequest } from "../../middleware/auth";
 import { sendSuccess, sendError } from "../../utils/response";
 import { db } from "../../db/index";
 import { domainNotifier } from "../../services/notification.service";
@@ -12,9 +12,9 @@ router.use(requireAuth, requireRider);
 
 /**
  * PATCH /api/rider/toggle-online
- * Toggles a rider's presence on the dispatch network
+ * Toggle rider online/offline status manually
  */
-router.patch("/toggle-online", requireWalletEligibleRider, async (req: AuthenticatedRequest, res: Response) => {
+router.patch("/toggle-online", requireVerifiedRider, requireWalletEligibleRider, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const statusRows = await db.query("SELECT is_online FROM rider_profiles WHERE user_id = $1", [req.user!.id]);
     if (statusRows.length === 0) {
@@ -244,7 +244,7 @@ router.post("/documents", async (req: Request, res: Response) => {
 /**
  * POST /api/rider/go-online
  */
-router.post("/go-online", requireWalletEligibleRider, async (req: Request, res: Response) => {
+router.post("/go-online", requireVerifiedRider, requireWalletEligibleRider, async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
   await db.query("UPDATE rider_profiles SET is_online = true, updated_at = NOW() WHERE user_id = $1", [authReq.user!.id]);
   return sendSuccess(res, { is_online: true, message: "You are now online." });
@@ -328,7 +328,7 @@ router.post("/jobs/:id/accept", requireWalletEligibleRider, async (req: Request,
     await db.query("COMMIT");
 
     const customer = await db.query("SELECT phone FROM users WHERE id = $1", [ride[0].customer_id]);
-    const rider = await db.query("SELECT u.full_name, rp.vehicle_number, rp.vehicle_model FROM users u LEFT JOIN rider_profiles rp ON u.id = rp.user_id WHERE u.id = $1", [authReq.user!.id]);
+    const rider = await db.query("SELECT u.full_name, rv.registration_number AS vehicle_number, rv.make_model AS vehicle_model FROM users u LEFT JOIN rider_vehicles rv ON u.id = rv.rider_id WHERE u.id = $1", [authReq.user!.id]);
 
     if (customer.length > 0 && rider.length > 0) {
       await domainNotifier.dispatch(customer[0].phone, "rider_assigned", {
@@ -416,6 +416,85 @@ router.post("/jobs/:id/complete", async (req: Request, res: Response) => {
     return sendSuccess(res, { message: "Ride completed successfully." });
   } catch (error: any) {
     return sendError(res, "UPDATE_FAILED", error.message);
+  }
+});
+
+/**
+ * GET /api/rider/vehicle
+ */
+router.get("/vehicle", async (req: Request, res: Response) => {
+  const authReq = req as AuthenticatedRequest;
+  try {
+    const vehicles = await db.query("SELECT * FROM rider_vehicles WHERE rider_id = $1", [authReq.user!.id]);
+    return sendSuccess(res, { vehicle: vehicles[0] || null });
+  } catch (error: any) {
+    return sendError(res, "FETCH_FAILED", error.message);
+  }
+});
+
+/**
+ * POST /api/rider/vehicle
+ */
+router.post("/vehicle", async (req: Request, res: Response) => {
+  const authReq = req as AuthenticatedRequest;
+  const { make_model, color, license_plate, year, vehicle_category, registration_number, ownership_status } = req.body;
+  try {
+    const existing = await db.query("SELECT id FROM rider_vehicles WHERE rider_id = $1", [authReq.user!.id]);
+    if (existing.length > 0) {
+      await db.query(
+        `UPDATE rider_vehicles SET make_model=$1, color=$2, license_plate=$3, year=$4, vehicle_category=$5, registration_number=$6, ownership_status=$7, verification_status='pending' WHERE rider_id=$8`,
+        [make_model, color, license_plate, year, vehicle_category, registration_number, ownership_status, authReq.user!.id]
+      );
+    } else {
+      const vid = "veh_" + Math.random().toString(36).substring(2, 10);
+      await db.query(
+        `INSERT INTO rider_vehicles (id, rider_id, make_model, color, license_plate, year, vehicle_category, registration_number, ownership_status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [vid, authReq.user!.id, make_model, color, license_plate, year, vehicle_category, registration_number, ownership_status]
+      );
+    }
+    return sendSuccess(res, { message: "Vehicle details updated successfully." });
+  } catch (error: any) {
+    return sendError(res, "UPDATE_FAILED", error.message);
+  }
+});
+
+/**
+ * GET /api/rider/documents
+ */
+router.get("/documents", async (req: Request, res: Response) => {
+  const authReq = req as AuthenticatedRequest;
+  try {
+    const docs = await db.query("SELECT * FROM rider_documents WHERE rider_id = $1", [authReq.user!.id]);
+    return sendSuccess(res, { documents: docs });
+  } catch (error: any) {
+    return sendError(res, "FETCH_FAILED", error.message);
+  }
+});
+
+/**
+ * POST /api/rider/documents
+ */
+router.post("/documents", async (req: Request, res: Response) => {
+  const authReq = req as AuthenticatedRequest;
+  const { document_type, file_url } = req.body;
+  try {
+    const existing = await db.query("SELECT id FROM rider_documents WHERE rider_id = $1 AND document_type = $2", [authReq.user!.id, document_type]);
+    if (existing.length > 0) {
+      await db.query(
+        "UPDATE rider_documents SET file_url = $1, status = 'pending_review' WHERE id = $2",
+        [file_url, existing[0].id]
+      );
+    } else {
+      const did = "doc_" + Math.random().toString(36).substring(2, 10);
+      await db.query(
+        "INSERT INTO rider_documents (id, rider_id, document_type, file_url) VALUES ($1, $2, $3, $4)",
+        [did, authReq.user!.id, document_type, file_url]
+      );
+    }
+    return sendSuccess(res, { message: "Document uploaded successfully." });
+  } catch (error: any) {
+    return sendError(res, "UPLOAD_FAILED", error.message);
   }
 });
 

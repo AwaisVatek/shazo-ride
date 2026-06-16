@@ -417,10 +417,11 @@ router.get("/nearby-riders", requireAuth, async (req: Request, res: Response) =>
 
   try {
     const activeRiders = await db.query(
-      `SELECT rp.user_id, u.full_name, u.phone, rp.vehicle_type, rp.latitude, rp.longitude,
+      `SELECT rp.user_id, u.full_name, u.phone, COALESCE(rv.vehicle_category, rp.vehicle_type) AS vehicle_type, rp.latitude, rp.longitude,
               (6371 * acos(cos(radians($1)) * cos(radians(rp.latitude)) * cos(radians(rp.longitude) - radians($2)) + sin(radians($3)) * sin(radians(rp.latitude)))) AS distance_km
        FROM rider_profiles rp
        JOIN users u ON rp.user_id = u.id
+       LEFT JOIN rider_vehicles rv ON rv.rider_id = rp.user_id
        WHERE rp.is_online = true AND rp.verification_status = 'verified'
        ORDER BY distance_km ASC`,
       [latNum, lngNum, latNum]
