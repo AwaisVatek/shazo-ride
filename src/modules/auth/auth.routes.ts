@@ -671,8 +671,8 @@ router.post("/signup-password", async (req: Request, res: Response) => {
         console.log("[SIGNUP] Inserting rider_profiles");
         const riderProfId = "rpr_" + crypto.randomUUID().slice(0, 8);
         await client.query(
-          `INSERT INTO rider_profiles (id, user_id, vehicle_type, default_city) VALUES ($1, $2, $3, $4)`,
-          [riderProfId, userId, null, default_city || null]
+          `INSERT INTO rider_profiles (id, user_id, vehicle_type) VALUES ($1, $2, $3)`,
+          [riderProfId, userId, null]
         );
         console.log("[SIGNUP] Inserting rider_wallets");
         const walletId = "wal_" + crypto.randomUUID().slice(0, 8);
