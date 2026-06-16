@@ -3,6 +3,17 @@
 -- 1. Rename existing vehicles table to rider_vehicles
 ALTER TABLE IF EXISTS vehicles RENAME TO rider_vehicles;
 
+-- 1b. Rename driver_id to rider_id if the user's live database used driver_id
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns 
+    WHERE table_name = 'rider_vehicles' AND column_name = 'driver_id'
+  ) THEN
+    ALTER TABLE rider_vehicles RENAME COLUMN driver_id TO rider_id;
+  END IF;
+END $$;
+
 -- 2. Add missing columns to rider_vehicles
 ALTER TABLE rider_vehicles 
   ADD COLUMN IF NOT EXISTS vehicle_category VARCHAR(50),
