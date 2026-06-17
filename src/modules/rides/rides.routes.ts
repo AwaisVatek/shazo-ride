@@ -516,4 +516,30 @@ router.get("/:id/status", requireAuth, async (req: Request, res: Response) => {
   }
 });
 
+router.get("/:id", requireAuth, async (req: Request, res: Response) => {
+  try {
+    const rides = await db.query("SELECT * FROM ride_bookings WHERE id = $1", [req.params.id]);
+    if (rides.length === 0) return sendError(res, "NOT_FOUND", "Ride not found");
+    
+    // Also fetch driver details if assigned
+    const ride = rides[0];
+    if (ride.rider_id) {
+      const drivers = await db.query("SELECT full_name as name, phone, id FROM users WHERE id = $1", [ride.rider_id]);
+      if (drivers.length > 0) {
+        ride.driver = drivers[0];
+        // Fetch vehicle
+        const vehicles = await db.query("SELECT * FROM rider_vehicles WHERE rider_id = $1", [ride.rider_id]);
+        if (vehicles.length > 0) {
+          ride.driver.vehicle_number = vehicles[0].license_plate || vehicles[0].registration_number;
+          ride.vehicle_info = vehicles[0];
+        }
+      }
+    }
+    
+    return sendSuccess(res, ride);
+  } catch (err: any) {
+    return sendError(res, "FETCH_FAILED", err.message, 500);
+  }
+});
+
 export default router;
