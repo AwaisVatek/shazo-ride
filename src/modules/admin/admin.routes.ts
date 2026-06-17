@@ -153,7 +153,7 @@ router.get("/riders", async (req: AuthenticatedRequest, res: Response) => {
     FROM users u
     LEFT JOIN rider_profiles rp ON rp.user_id = u.id
     LEFT JOIN rider_vehicles rv ON rv.rider_id = u.id
-    LEFT JOIN rider_wallets rw ON rw.rider_id = u.id
+    LEFT JOIN rider_wallets rw ON rw.rider_id = rp.id
     WHERE u.role = 'rider'
     ORDER BY u.created_at DESC
     LIMIT 100
