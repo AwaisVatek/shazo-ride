@@ -127,8 +127,8 @@ router.post("/estimate", requireAuth, async (req: Request, res: Response) => {
  * POST /api/rides/book
  * Submits custom ride request to the dispatch network queue
  */
-router.post("/book", requireAuth, async (req: AuthenticatedRequest, res: Response) => {
-  const { pickup_address, pickup_lat, pickup_lng, dropoff_address, dropoff_lat, dropoff_lng, ride_type, payment_method, promo_code, proposed_fare } = req.body;
+router.post("/request", requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const { pickup_address, pickup_lat, pickup_lng, dropoff_address, dropoff_lat, dropoff_lng, vehicle_category: ride_type, payment_method, promo_code, customer_offer_fare: proposed_fare } = req.body;
 
   if (!pickup_address || pickup_lat === undefined || pickup_lng === undefined || !dropoff_address || dropoff_lat === undefined || dropoff_lng === undefined || !ride_type) {
     return sendError(res, "VALIDATION_FAILED", "Please provide complete routing landmarks and geographic coordinates.");
