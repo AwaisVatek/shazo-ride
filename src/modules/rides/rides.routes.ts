@@ -44,16 +44,25 @@ router.post("/estimate", requireAuth, async (req: Request, res: Response) => {
       body: JSON.stringify({ origin_lat: pickup_lat, origin_lng: pickup_lng, dest_lat: dropoff_lat, dest_lng: dropoff_lng })
     });
 
-    if (!distResponse.ok) {
-      throw new Error(`Maps backend rejected distance matrix: status ${distResponse.status}`);
-    }
+    let distance_km = 5.0;
+    let duration_minutes = 15;
 
-    const distBody: any = await distResponse.json();
-    if (!distBody.ok) {
-      throw new Error(distBody.error?.message || "Failed computing route details.");
+    if (distResponse.ok) {
+      const distBody: any = await distResponse.json();
+      if (distBody.ok) {
+        distance_km = distBody.data.distance_km;
+        duration_minutes = distBody.data.duration_minutes;
+      }
+    } else {
+      // Fallback: Haversine straight-line distance if Maps API fails
+      const R = 6371; // Earth radius in km
+      const dLat = (dropoff_lat - pickup_lat) * Math.PI / 180;
+      const dLng = (dropoff_lng - pickup_lng) * Math.PI / 180;
+      const a = Math.sin(dLat/2) * Math.sin(dLat/2) + Math.cos(pickup_lat * Math.PI / 180) * Math.cos(dropoff_lat * Math.PI / 180) * Math.sin(dLng/2) * Math.sin(dLng/2);
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+      distance_km = Math.max(2.0, R * c * 1.3); // 1.3 road multiplier
+      duration_minutes = Math.max(5, distance_km * 3); // ~3 mins per km
     }
-
-    const { distance_km, duration_minutes } = distBody.data;
 
     // 2. Fetch service fare configuration rules from SQL
     const activeSettings = await db.query("SELECT * FROM service_settings WHERE is_active = true");
