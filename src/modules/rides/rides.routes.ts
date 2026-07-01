@@ -35,25 +35,38 @@ router.post("/estimate", requireAuth, async (req: Request, res: Response) => {
 
   try {
     // 1. Calculate road routing distance using our maps module
-    const distResponse = await fetch(`${config.API_BASE_URL}/api/maps/distance`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": req.headers.authorization!
-      },
-      body: JSON.stringify({ origin_lat: pickup_lat, origin_lng: pickup_lng, dest_lat: dropoff_lat, dest_lng: dropoff_lng })
-    });
+    let distResponse: any = null;
+    try {
+      distResponse = await fetch(`${config.API_BASE_URL}/api/maps/distance`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": req.headers.authorization!
+        },
+        body: JSON.stringify({ origin_lat: pickup_lat, origin_lng: pickup_lng, dest_lat: dropoff_lat, dest_lng: dropoff_lng })
+      });
+    } catch (e) {
+      console.warn("Self-fetch for distance failed:", e);
+    }
 
     let distance_km = 5.0;
     let duration_minutes = 15;
 
-    if (distResponse.ok) {
-      const distBody: any = await distResponse.json();
-      if (distBody.ok) {
-        distance_km = distBody.data.distance_km;
-        duration_minutes = distBody.data.duration_minutes;
+    if (distResponse && distResponse.ok) {
+      try {
+        const distBody: any = await distResponse.json();
+        if (distBody.ok) {
+          distance_km = distBody.data.distance_km;
+          duration_minutes = distBody.data.duration_minutes;
+        } else {
+          throw new Error("API returned not ok");
+        }
+      } catch (e) {
+        distResponse = null; // force fallback
       }
-    } else {
+    }
+    
+    if (!distResponse || !distResponse.ok) {
       // Fallback: Haversine straight-line distance if Maps API fails
       const R = 6371; // Earth radius in km
       const dLat = (dropoff_lat - pickup_lat) * Math.PI / 180;
@@ -156,40 +169,67 @@ router.post("/request", requireAuth, async (req: AuthenticatedRequest, res: Resp
     }
 
     // 2. Fetch Distance stats for permanent storage record
-    const statsResponse = await fetch(`${config.API_BASE_URL}/api/maps/distance`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": req.headers.authorization!
-      },
-      body: JSON.stringify({ origin_lat: pickup_lat, origin_lng: pickup_lng, dest_lat: dropoff_lat, dest_lng: dropoff_lng })
-    });
+    let statsResponse: any = null;
+    try {
+      statsResponse = await fetch(`${config.API_BASE_URL}/api/maps/distance`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": req.headers.authorization!
+        },
+        body: JSON.stringify({ origin_lat: pickup_lat, origin_lng: pickup_lng, dest_lat: dropoff_lat, dest_lng: dropoff_lng })
+      });
+    } catch (e) {
+      console.warn("Self-fetch for request distance failed:", e);
+    }
 
     let distance_km = 5.0;
     let duration_minutes = 15;
 
-    if (statsResponse.ok) {
-      const statsJson: any = await statsResponse.json();
-      if (statsJson.ok) {
-        distance_km = statsJson.data.distance_km;
-        duration_minutes = statsJson.data.duration_minutes;
+    if (statsResponse && statsResponse.ok) {
+      try {
+        const statsJson: any = await statsResponse.json();
+        if (statsJson.ok) {
+          distance_km = statsJson.data.distance_km;
+          duration_minutes = statsJson.data.duration_minutes;
+        } else {
+          throw new Error("API returned not ok");
+        }
+      } catch (e) {
+        statsResponse = null;
       }
+    }
+    
+    if (!statsResponse || !statsResponse.ok) {
+      // Fallback: Haversine
+      const R = 6371; 
+      const dLat = (dropoff_lat - pickup_lat) * Math.PI / 180;
+      const dLng = (dropoff_lng - pickup_lng) * Math.PI / 180;
+      const a = Math.sin(dLat/2) * Math.sin(dLat/2) + Math.cos(pickup_lat * Math.PI / 180) * Math.cos(dropoff_lat * Math.PI / 180) * Math.sin(dLng/2) * Math.sin(dLng/2);
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+      distance_km = Math.max(2.0, R * c * 1.3);
+      duration_minutes = Math.max(5, distance_km * 3);
     }
 
     // 3. Compute proper fare from defaults or honor user's proposed bid
     let fare = proposed_fare ? Number(proposed_fare) : 150;
     let min_fare = 0;
     
-    const estResponse = await fetch(`${config.API_BASE_URL}/api/rides/estimate`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": req.headers.authorization!
-      },
-      body: JSON.stringify({ pickup_lat, pickup_lng, dropoff_lat, dropoff_lng, promo_code })
-    });
+    let estResponse: any = null;
+    try {
+      estResponse = await fetch(`${config.API_BASE_URL}/api/rides/estimate`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": req.headers.authorization!
+        },
+        body: JSON.stringify({ pickup_lat, pickup_lng, dropoff_lat, dropoff_lng, promo_code })
+      });
+    } catch(e) {
+      console.warn("Self-fetch for estimate failed:", e);
+    }
 
-    if (estResponse.ok) {
+    if (estResponse && estResponse.ok) {
       const estJson: any = await estResponse.json();
       if (estJson.ok) {
         const match = estJson.data.estimates.find((e: any) => e.service_type === ride_type);
