@@ -140,10 +140,13 @@ export async function seed() {
     // 8. Service Settings & Default Karachi Fare Formulas
     await db.query(
       `INSERT INTO service_settings (id, service_type, base_fare, per_km_rate, per_minute_rate, minimum_fare, commission_percentage, commission_fixed) VALUES
-       ('srv_bike', 'bike', 50.00, 15.00, 1.50, 80.00, 10.00, 0.00),
-       ('srv_car', 'car', 150.00, 35.00, 3.00, 200.00, 12.00, 0.00),
-       ('srv_ambulance', 'ambulance', 800.00, 45.00, 0.00, 1200.00, 5.00, 0.00),
-       ('srv_food', 'food_delivery', 50.00, 20.00, 0.00, 60.00, 15.00, 10.00)`
+       ('srv_bike', 'bike', 70.00, 15.00, 0.00, 0.00, 10.00, 0.00),
+       ('srv_rickshaw', 'rickshaw', 80.00, 20.00, 0.00, 0.00, 10.00, 0.00),
+       ('srv_car_mini', 'car_mini', 100.00, 24.00, 0.00, 0.00, 12.00, 0.00),
+       ('srv_car_ac', 'car_ac', 120.00, 30.00, 0.00, 0.00, 12.00, 0.00),
+       ('srv_car_luxury', 'car_luxury', 150.00, 40.00, 0.00, 0.00, 15.00, 0.00),
+       ('srv_food', 'food_delivery', 70.00, 18.00, 0.00, 0.00, 15.00, 10.00)
+       ON CONFLICT (service_type) DO NOTHING`
     );
 
     // 9. Manual Payment Account Definitions (Easypaisa/Jazzcash/Bank accounts)

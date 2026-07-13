@@ -437,31 +437,19 @@ router.patch("/settings/manual-payment-accounts/:id", async (req: AuthenticatedR
 });
 
 router.get("/settings/fares", async (req: AuthenticatedRequest, res: Response) => {
-  await safeRows("init fare settings", `
-    CREATE TABLE IF NOT EXISTS fare_settings (
-      id TEXT PRIMARY KEY,
-      service_type TEXT NOT NULL UNIQUE,
-      service_label TEXT NOT NULL,
-      base_fare NUMERIC(10,2) NOT NULL DEFAULT 0,
-      per_km_rate NUMERIC(10,2) NOT NULL DEFAULT 0,
-      per_minute_rate NUMERIC(10,2) NOT NULL DEFAULT 0,
-      minimum_fare NUMERIC(10,2) NOT NULL DEFAULT 0,
-      cancellation_fee NUMERIC(10,2) NOT NULL DEFAULT 0,
-      night_surcharge NUMERIC(10,2) NOT NULL DEFAULT 0,
-      peak_time_multiplier NUMERIC(10,2) NOT NULL DEFAULT 1,
-      free_waiting_minutes INTEGER NOT NULL DEFAULT 0,
-      waiting_charge_per_minute NUMERIC(10,2) NOT NULL DEFAULT 0,
-      is_active BOOLEAN NOT NULL DEFAULT true,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    )
+  // Ensure the extra columns exist in service_settings since we are deprecating fare_settings
+  await safeRows("migrate service_settings columns", `
+    ALTER TABLE service_settings ADD COLUMN IF NOT EXISTS peak_time_multiplier NUMERIC(10,2) NOT NULL DEFAULT 1.00;
+  `);
+  await safeRows("migrate service_settings columns", `
+    ALTER TABLE service_settings ADD COLUMN IF NOT EXISTS cancellation_fee NUMERIC(10,2) NOT NULL DEFAULT 0.00;
   `);
 
   const items = await safeRows<any>("fares", `
     SELECT
       id,
       service_type,
-      service_label AS name,
+      service_type AS name,
       base_fare,
       per_km_rate,
       per_minute_rate,
@@ -469,9 +457,8 @@ router.get("/settings/fares", async (req: AuthenticatedRequest, res: Response) =
       cancellation_fee AS cancel_fee,
       peak_time_multiplier AS peak_hour_multiplier,
       is_active,
-      created_at,
       updated_at
-    FROM fare_settings
+    FROM service_settings
     ORDER BY service_type ASC
   `);
 
@@ -482,10 +469,9 @@ router.post("/settings/fares", async (req: AuthenticatedRequest, res: Response) 
   const fares = req.body?.fares || [];
   for (const fare of fares) {
     await safeRows("save fare", `
-      INSERT INTO fare_settings (id, service_type, service_label, base_fare, per_km_rate, per_minute_rate, minimum_fare, cancellation_fee, peak_time_multiplier)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      INSERT INTO service_settings (id, service_type, base_fare, per_km_rate, per_minute_rate, minimum_fare, cancellation_fee, peak_time_multiplier)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
       ON CONFLICT (service_type) DO UPDATE SET 
-        service_label = EXCLUDED.service_label,
         base_fare = EXCLUDED.base_fare,
         per_km_rate = EXCLUDED.per_km_rate,
         per_minute_rate = EXCLUDED.per_minute_rate,
@@ -494,9 +480,8 @@ router.post("/settings/fares", async (req: AuthenticatedRequest, res: Response) 
         peak_time_multiplier = EXCLUDED.peak_time_multiplier,
         updated_at = NOW()
     `, [
-      `fare_${fare.serviceType}`,
+      `srv_${fare.serviceType}`,
       fare.serviceType,
-      fare.serviceLabel || fare.serviceType,
       Number(fare.baseFare || 0),
       Number(fare.perKmRate || 0),
       Number(fare.perMinRate || 0),
