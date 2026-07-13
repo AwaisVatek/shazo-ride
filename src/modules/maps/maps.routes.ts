@@ -15,6 +15,9 @@ function verifyMapsKey(res: Response): boolean {
   return true;
 }
 
+const NOMINATIM_BASE = process.env.NOMINATIM_URL || "https://nominatim.openstreetmap.org";
+const OSRM_BASE = process.env.OSRM_URL || "http://router.project-osrm.org";
+
 function verifyGeocodingKey(res: Response): boolean {
   return true; // Deprecated, we use Nominatim now
 }
@@ -35,7 +38,7 @@ router.get("/autocomplete", requireAuth, async (req: Request, res: Response) => 
       return sendSuccess(res, JSON.parse(cached[0].response_json));
     }
 
-    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=json&viewbox=66.82,25.18,67.42,24.73&bounded=1&limit=5`;
+    const url = `${NOMINATIM_BASE}/search?q=${encodeURIComponent(query)}&format=json&viewbox=66.82,25.18,67.42,24.73&bounded=1&limit=5`;
     const apiResponse = await fetch(url, { headers: { 'User-Agent': 'ShazoRideApp/1.0' } });
     if (!apiResponse.ok) {
       throw new Error(`Nominatim Autocomplete failed with status code ${apiResponse.status}`);
@@ -86,7 +89,7 @@ router.get("/place-details", requireAuth, async (req: Request, res: Response) =>
       return sendSuccess(res, JSON.parse(cached[0].response_json));
     }
 
-    const url = `https://nominatim.openstreetmap.org/details?place_id=${placeId}&format=json`;
+    const url = `${NOMINATIM_BASE}/details?place_id=${placeId}&format=json`;
     const apiResponse = await fetch(url, { headers: { 'User-Agent': 'ShazoRideApp/1.0' } });
     if (!apiResponse.ok) {
       throw new Error(`Nominatim Place Details failed with status code ${apiResponse.status}`);
@@ -132,7 +135,7 @@ router.post("/geocode", requireAuth, async (req: Request, res: Response) => {
       return sendSuccess(res, JSON.parse(cached[0].response_json));
     }
 
-    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(address)}&format=json&limit=1`;
+    const url = `${NOMINATIM_BASE}/search?q=${encodeURIComponent(address)}&format=json&limit=1`;
     const response = await fetch(url, { headers: { 'User-Agent': 'ShazoRideApp/1.0' } });
     if (!response.ok) {
       throw new Error(`Nominatim Geocoding failed with status code ${response.status}`);
@@ -180,7 +183,7 @@ router.post("/reverse-geocode", requireAuth, async (req: Request, res: Response)
       return sendSuccess(res, JSON.parse(cached[0].response_json));
     }
 
-    const url = `https://nominatim.openstreetmap.org/reverse?lat=${latitude}&lon=${longitude}&format=json`;
+    const url = `${NOMINATIM_BASE}/reverse?lat=${latitude}&lon=${longitude}&format=json`;
     const response = await fetch(url, { headers: { 'User-Agent': 'ShazoRideApp/1.0' } });
     if (!response.ok) {
       throw new Error(`Nominatim Reverse Geocoding failed with status code ${response.status}`);
@@ -227,7 +230,7 @@ router.post("/distance", requireAuth, async (req: Request, res: Response) => {
       return sendSuccess(res, JSON.parse(cached[0].response_json));
     }
 
-    const url = `http://router.project-osrm.org/route/v1/driving/${origin_lng},${origin_lat};${dest_lng},${dest_lat}?overview=false`;
+    const url = `${OSRM_BASE}/route/v1/driving/${origin_lng},${origin_lat};${dest_lng},${dest_lat}?overview=false`;
     const response = await fetch(url, { headers: { 'User-Agent': 'ShazoRideApp/1.0' } });
     if (!response.ok) {
       throw new Error(`OSRM Routing failed with status code ${response.status}`);
@@ -264,7 +267,7 @@ router.post("/place-autocomplete", requireAuth, async (req: Request, res: Respon
   if (!address) return sendError(res, "VALIDATION_FAILED", "Address needed.");
 
   try {
-    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(address)}&format=json&limit=5`;
+    const url = `${NOMINATIM_BASE}/search?q=${encodeURIComponent(address)}&format=json&limit=5`;
     const apiResponse = await fetch(url, { headers: { 'User-Agent': 'ShazoRideApp/1.0' } });
     if (!apiResponse.ok) throw new Error("Failed");
     const body: any = await apiResponse.json();
