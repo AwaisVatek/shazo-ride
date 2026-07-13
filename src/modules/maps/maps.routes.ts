@@ -84,12 +84,6 @@ router.get("/autocomplete", requireAuth, async (req: Request, res: Response) => 
   }
 });
 
-    return sendSuccess(res, predictions);
-  } catch (err: any) {
-    return sendError(res, "AUTOCOMPLETE_ERROR", err.message, 500);
-  }
-});
-
 /**
  * GET /api/maps/place-details
  * Retrieve detailed geometry for a specific place_id
@@ -129,12 +123,6 @@ router.get("/place-details", requireAuth, async (req: Request, res: Response) =>
        ON CONFLICT (query) DO UPDATE SET response_json = EXCLUDED.response_json`,
       [cacheKey, JSON.stringify(details)]
     ).catch(() => {});
-
-    return sendSuccess(res, details);
-  } catch (err: any) {
-    return sendError(res, "PLACE_DETAILS_ERROR", err.message, 500);
-  }
-});
 
     return sendSuccess(res, details);
   } catch (err: any) {
