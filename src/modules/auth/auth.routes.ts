@@ -248,8 +248,7 @@ router.post("/email/signup", async (req: Request, res: Response) => {
       ["auth_" + crypto.randomUUID().slice(0, 8), userId, email.toLowerCase().trim()]
     );
 
-    const custProfId = "cpr_" + crypto.randomUUID().slice(0, 8);
-    await db.query("INSERT INTO customer_profiles (id, user_id) VALUES ($1, $2)", [custProfId, userId]);
+    await db.query("INSERT INTO customer_profiles (user_id) VALUES ($1)", [userId]);
 
     return sendSuccess(res, {
       message: "Registration completed successfully. Welcome to Shazo!",
@@ -536,10 +535,9 @@ router.post("/verify-otp", async (req: Request, res: Response) => {
       );
 
       if (role === "customer") {
-        const custProfId = "cpr_" + crypto.randomUUID().slice(0, 8);
         await db.query(
-          `INSERT INTO customer_profiles (id, user_id) VALUES ($1, $2)`, 
-          [custProfId, newId]
+          `INSERT INTO customer_profiles (user_id) VALUES ($1)`, 
+          [newId]
         );
       } else if (role === "rider") {
         await db.query("INSERT INTO rider_profiles (user_id) VALUES ($1)", [newId]);
@@ -662,23 +660,20 @@ router.post("/signup-password", async (req: Request, res: Response) => {
 
       if (role === "customer") {
         console.log("[SIGNUP] Inserting customer_profiles");
-        const custProfId = "cpr_" + crypto.randomUUID().slice(0, 8);
         await client.query(
-          `INSERT INTO customer_profiles (id, user_id, default_city) VALUES ($1, $2, $3)`, 
-          [custProfId, userId, default_city || null]
+          `INSERT INTO customer_profiles (user_id, default_city) VALUES ($1, $2)`, 
+          [userId, default_city || null]
         );
       } else if (role === "rider") {
         console.log("[SIGNUP] Inserting rider_profiles");
-        const riderProfId = "rpr_" + crypto.randomUUID().slice(0, 8);
         await client.query(
-          `INSERT INTO rider_profiles (id, user_id, vehicle_type) VALUES ($1, $2, $3)`,
-          [riderProfId, userId, null]
+          `INSERT INTO rider_profiles (user_id, vehicle_type) VALUES ($1, $2)`,
+          [userId, null]
         );
         console.log("[SIGNUP] Inserting rider_wallets");
-        const walletId = "wal_" + crypto.randomUUID().slice(0, 8);
         await client.query(
-          `INSERT INTO rider_wallets (id, rider_id, balance) VALUES ($1, $2, 0)`,
-          [walletId, riderProfId]
+          `INSERT INTO rider_wallets (rider_id, balance) VALUES ($1, 0)`,
+          [userId]
         );
       }
 
