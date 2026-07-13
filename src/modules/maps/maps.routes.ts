@@ -37,8 +37,6 @@ function verifyGeocodingKey(res: Response): boolean {
  * Search places by text query
  */
 router.get("/autocomplete", requireAuth, async (req: Request, res: Response) => {
-  if (!verifyMapsKey(res)) return;
-
   const query = req.query.query as string;
   if (!query) {
     return sendError(res, "VALIDATION_FAILED", "Please specify a query string.");
@@ -51,18 +49,28 @@ router.get("/autocomplete", requireAuth, async (req: Request, res: Response) => 
       return sendSuccess(res, JSON.parse(cached[0].response_json));
     }
 
-    const url = `https://maps.googleapis.com/maps/api/place/autocomplete/json?input=${encodeURIComponent(query)}&components=country:pk&key=${config.MAPS_API_KEY}`;
-    const apiResponse = await fetch(url);
+    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=json&viewbox=66.82,25.18,67.42,24.73&bounded=1&limit=5`;
+    const apiResponse = await fetch(url, { headers: { 'User-Agent': 'ShazoRideApp/1.0' } });
     if (!apiResponse.ok) {
-      throw new Error(`Google Places Autocomplete failed with status code ${apiResponse.status}`);
+      throw new Error(`Nominatim Autocomplete failed with status code ${apiResponse.status}`);
     }
 
     const body: any = await apiResponse.json();
-    if (body.status === "REQUEST_DENIED") {
-      return sendError(res, "MAPS_API_KEY_MISSING", "Google Maps API Key is invalid or restricted.", 400);
-    }
 
-    const predictions = body.predictions || [];
+    const predictions = body.map((item: any) => ({
+      place_id: item.place_id.toString(),
+      description: item.display_name,
+      geometry: {
+        location: {
+          lat: parseFloat(item.lat),
+          lng: parseFloat(item.lon)
+        }
+      },
+      structured_formatting: {
+        main_text: item.name,
+        secondary_text: item.display_name.replace(item.name + ', ', '')
+      }
+    }));
 
     await db.query(
       `INSERT INTO places_cache (query, response_json) VALUES ($1, $2)
@@ -76,13 +84,17 @@ router.get("/autocomplete", requireAuth, async (req: Request, res: Response) => 
   }
 });
 
+    return sendSuccess(res, predictions);
+  } catch (err: any) {
+    return sendError(res, "AUTOCOMPLETE_ERROR", err.message, 500);
+  }
+});
+
 /**
  * GET /api/maps/place-details
  * Retrieve detailed geometry for a specific place_id
  */
 router.get("/place-details", requireAuth, async (req: Request, res: Response) => {
-  if (!verifyMapsKey(res)) return;
-
   const placeId = req.query.placeId as string;
   if (!placeId) {
     return sendError(res, "VALIDATION_FAILED", "A place_id is mandatory.");
@@ -95,32 +107,21 @@ router.get("/place-details", requireAuth, async (req: Request, res: Response) =>
       return sendSuccess(res, JSON.parse(cached[0].response_json));
     }
 
-    const url = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${placeId}&key=${config.MAPS_API_KEY}`;
-    const apiResponse = await fetch(url);
+    const url = `https://nominatim.openstreetmap.org/details?place_id=${placeId}&format=json`;
+    const apiResponse = await fetch(url, { headers: { 'User-Agent': 'ShazoRideApp/1.0' } });
     if (!apiResponse.ok) {
-      throw new Error(`Google Place Details failed with status code ${apiResponse.status}`);
+      throw new Error(`Nominatim Place Details failed with status code ${apiResponse.status}`);
     }
 
     const body: any = await apiResponse.json();
-    if (body.status === "REQUEST_DENIED") {
-      return sendError(res, "MAPS_API_KEY_MISSING", "Google Maps API Key is invalid or restricted.", 400);
-    }
-
-    const result = body.result;
-    if (!result) {
-      return sendError(res, "PLACE_NOT_FOUND", "The requested place_id details could not be found.", 404);
-    }
-
-    const loc = result.geometry?.location;
-    if (!loc) {
-      return sendError(res, "PLACE_GEOMETRY_MISSING", "No latitude or longitude geometry returned for this place.", 400);
-    }
-
     const details = {
-      address: result.formatted_address,
-      latitude: loc.lat,
-      longitude: loc.lng,
-      place_id: placeId
+      place_id: placeId,
+      geometry: {
+        location: {
+          lat: parseFloat(body.centroid?.coordinates?.[1] || 0),
+          lng: parseFloat(body.centroid?.coordinates?.[0] || 0)
+        }
+      }
     };
 
     await db.query(
@@ -128,6 +129,12 @@ router.get("/place-details", requireAuth, async (req: Request, res: Response) =>
        ON CONFLICT (query) DO UPDATE SET response_json = EXCLUDED.response_json`,
       [cacheKey, JSON.stringify(details)]
     ).catch(() => {});
+
+    return sendSuccess(res, details);
+  } catch (err: any) {
+    return sendError(res, "PLACE_DETAILS_ERROR", err.message, 500);
+  }
+});
 
     return sendSuccess(res, details);
   } catch (err: any) {
