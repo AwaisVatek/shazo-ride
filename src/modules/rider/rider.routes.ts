@@ -1,5 +1,4 @@
 import { Router, Request, Response } from "express";
-import crypto from "crypto";
 import { requireAuth, requireRider, requireWalletEligibleRider, requireVerifiedRider, AuthenticatedRequest } from "../../middleware/auth";
 import { sendSuccess, sendError } from "../../utils/response";
 import { db } from "../../db/index";
@@ -11,6 +10,17 @@ const router = Router();
 
 // Secure entire route segment to riders only
 router.use(requireAuth, requireRider);
+
+// rider_wallets/rider_wallet_ledger/rider_vehicles/rider_documents all key
+// rider_id off rider_profiles.id, NOT users.id — every handler that touches
+// those tables must resolve this first instead of using the authenticated
+// user's own id directly (found via pg_get_constraintdef against production;
+// this was silently breaking wallet balance, vehicle, and document lookups
+// for every rider).
+async function resolveRiderProfileId(userId: string): Promise<string | null> {
+  const rows = await db.query("SELECT id FROM rider_profiles WHERE user_id = $1", [userId]);
+  return rows.length > 0 ? rows[0].id : null;
+}
 
 /**
  * PATCH /api/rider/toggle-online
@@ -46,14 +56,17 @@ router.patch("/toggle-online", requireVerifiedRider, requireWalletEligibleRider,
 router.get("/wallet", async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
   try {
-    const wallets = await db.query("SELECT balance FROM rider_wallets WHERE rider_id = $1", [authReq.user!.id]);
+    const riderProfileId = await resolveRiderProfileId(authReq.user!.id);
+    if (!riderProfileId) return sendError(res, "PROFILE_MISSING", "Rider profile not found.", 404);
+
+    const wallets = await db.query("SELECT balance FROM rider_wallets WHERE rider_id = $1", [riderProfileId]);
     const balance = wallets.length > 0 ? Number(wallets[0].balance) : 0.00;
 
     const ledger = await db.query(
-      `SELECT * FROM rider_wallet_ledger 
-       WHERE rider_id = $1 
+      `SELECT * FROM rider_wallet_ledger
+       WHERE rider_id = $1
        ORDER BY created_at DESC LIMIT 50`,
-      [authReq.user!.id]
+      [riderProfileId]
     );
 
     return sendSuccess(res, {
@@ -67,71 +80,69 @@ router.get("/wallet", async (req: Request, res: Response) => {
 });
 
 /**
+ * GET /api/rider/wallet/payment-accounts
+ * The active bank/mobile-wallet channels a rider can send a manual transfer
+ * to. Previously only exposed via an admin-only route — riders had no way to
+ * actually see which account to send money to before submitting a top-up
+ * request with a transaction ID (same gap as the customer app).
+ */
+router.get("/wallet/payment-accounts", async (req: Request, res: Response) => {
+  try {
+    const accounts = await db.query(
+      "SELECT id, account_type, bank_name, account_title, account_number, instructions FROM manual_payment_accounts WHERE is_active = true ORDER BY display_order ASC"
+    );
+    return sendSuccess(res, { accounts });
+  } catch (err: any) {
+    return sendError(res, "FETCH_PAYMENT_ACCOUNTS_FAILED", err.message);
+  }
+});
+
+/**
  * POST /api/rider/wallet/topup
- * Submits a top-up request to the manual verification queue
+ * Submits a top-up request to the manual verification queue.
+ *
+ * Was inserting into `wallet_topups`, a table that doesn't exist in the
+ * database at all — this endpoint 500'd on every single call. The real,
+ * admin-integrated table (already read/approved correctly by
+ * finance.routes.ts's PATCH /topups/:id, which credits rider_wallets on
+ * approval) is `manual_topup_requests`, with columns
+ * id/rider_id/amount/payment_method/transaction_id/screenshot_url/status —
+ * a near-exact match for this endpoint's payload. The old separate
+ * POST /manual-topup route also targeted this table but with column names
+ * that don't exist there either (method/sender_name/sender_phone/note vs.
+ * the real payment_method/notes) and nothing in the app called it — removed
+ * as broken, unused duplicate code rather than fixed in place.
  */
 router.post("/wallet/topup", async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
-  const { amount, payment_method, transaction_id } = req.body;
+  const { amount, payment_method, transaction_id, screenshot_url } = req.body;
 
   if (!amount || amount <= 0 || !payment_method || !transaction_id) {
     return sendError(res, "VALIDATION_FAILED", "Please provide a valid amount, payment method, and transaction ID.");
   }
 
   try {
-    // Check for duplicate pending transaction
+    const riderProfileId = await resolveRiderProfileId(authReq.user!.id);
+    if (!riderProfileId) return sendError(res, "PROFILE_MISSING", "Rider profile not found.", 404);
+
     const existing = await db.query(
-      "SELECT id FROM wallet_topups WHERE transaction_id = $1 OR (rider_id = $2 AND status = 'pending')",
-      [transaction_id, authReq.user!.id]
+      "SELECT id FROM manual_topup_requests WHERE transaction_id = $1 OR (rider_id = $2 AND status = 'pending')",
+      [transaction_id, riderProfileId]
     );
 
     if (existing.length > 0) {
       return sendError(res, "TOPUP_PENDING", "You already have a pending top-up or the transaction ID was already used.");
     }
 
-    const topupId = "wtp_" + crypto.randomUUID().slice(0, 8);
     await db.query(
-      `INSERT INTO wallet_topups (id, rider_id, amount, payment_method, transaction_id, status)
-       VALUES ($1, $2, $3, $4, $5, 'pending')`,
-      [topupId, authReq.user!.id, amount, payment_method, transaction_id]
+      `INSERT INTO manual_topup_requests (rider_id, amount, payment_method, transaction_id, screenshot_url)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [riderProfileId, amount, payment_method, transaction_id, screenshot_url || null]
     );
 
     return sendSuccess(res, { message: "Top-up request submitted successfully. It will be verified by an admin shortly." });
   } catch (error: any) {
     return sendError(res, "TOPUP_FAILED", error.message, 500);
-  }
-});
-
-/**
- * POST /api/rider/manual-topup
- * Submits manual payment receipt forms for wallet topup verifications
- */
-router.post("/manual-topup", async (req: AuthenticatedRequest, res: Response) => {
-  const { amount, method, sender_name, sender_phone, transaction_id, screenshot_url, note } = req.body;
-
-  if (!amount || !method || !sender_name || !sender_phone || !transaction_id) {
-    return sendError(res, "VALIDATION_FAILED", "Please provide complete transaction receipts information.");
-  }
-
-  try {
-    const topupId = "top_" + crypto.randomUUID().slice(0, 8);
-    await db.query(
-      `INSERT INTO manual_topup_requests (id, rider_id, amount, method, sender_name, sender_phone, transaction_id, screenshot_url, note, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending')`,
-      [topupId, req.user!.id, amount, method, sender_name, sender_phone, transaction_id, screenshot_url || null, note || ""]
-    );
-
-    return sendSuccess(res, {
-      requestId: topupId,
-      status: "pending",
-      message: "Receipt logged successfully. Financial desk audits complete manual payments in under 1 hour."
-    }, 201);
-
-  } catch (err: any) {
-    if (err.message?.includes("unique_transaction_id") || err.message?.includes("unique") || err.code === "23505") {
-      return sendError(res, "DUPLICATE_TX_ID", "This Transaction ID has already been logged. Do not duplicate filings.", 409);
-    }
-    return sendError(res, "TOPUP_LOG_FAILED", err.message, 500);
   }
 });
 
@@ -199,48 +210,53 @@ router.get("/me", async (req: Request, res: Response) => {
  */
 router.patch("/me", async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
-  const { full_name, email, profile_image_url, vehicle_type, vehicle_model, vehicle_number } = req.body;
+  const {
+    full_name, email, profile_image_url,
+    vehicle_type, vehicle_model, vehicle_number,
+    city, cnic, license_expiry,
+  } = req.body;
 
   try {
-    await db.query("BEGIN");
+    // Was manual BEGIN/COMMIT/ROLLBACK via db.query() — each call checks out
+    // its own connection from the pool, so nothing here was actually atomic
+    // (same bug found and fixed in the customer app's PATCH /customer/me).
+    // Also: city/cnic/license_expiry were collected by the registration
+    // screens but never accepted here at all — rider_profiles had no columns
+    // for city or license_expiry until migration 0017.
+    await db.transaction(async (client) => {
+      if (full_name !== undefined || email !== undefined || profile_image_url !== undefined) {
+        await client.query(
+          `UPDATE users SET
+            full_name = COALESCE($1, full_name),
+            email = COALESCE($2, email),
+            avatar_url = COALESCE($3, avatar_url),
+            updated_at = NOW()
+           WHERE id = $4`,
+          [full_name, email, profile_image_url, authReq.user!.id]
+        );
+      }
 
-    if (full_name !== undefined || email !== undefined || profile_image_url !== undefined) {
-      await db.query(
-        `UPDATE users SET 
-          full_name = COALESCE($1, full_name), 
-          email = COALESCE($2, email),
-          avatar_url = COALESCE($3, avatar_url),
-          updated_at = NOW()
-         WHERE id = $4`,
-        [full_name, email, profile_image_url, authReq.user!.id]
-      );
-    }
+      if (vehicle_type !== undefined || vehicle_model !== undefined || vehicle_number !== undefined
+        || city !== undefined || cnic !== undefined || license_expiry !== undefined) {
+        await client.query(
+          `UPDATE rider_profiles SET
+            vehicle_type = COALESCE($1, vehicle_type),
+            vehicle_model = COALESCE($2, vehicle_model),
+            vehicle_number = COALESCE($3, vehicle_number),
+            city = COALESCE($4, city),
+            cnic = COALESCE($5, cnic),
+            license_expiry = COALESCE($6, license_expiry),
+            updated_at = NOW()
+           WHERE user_id = $7`,
+          [vehicle_type, vehicle_model, vehicle_number, city, cnic, license_expiry || null, authReq.user!.id]
+        );
+      }
+    });
 
-    if (vehicle_type !== undefined || vehicle_model !== undefined || vehicle_number !== undefined) {
-      await db.query(
-        `UPDATE rider_profiles SET 
-          vehicle_type = COALESCE($1, vehicle_type),
-          vehicle_model = COALESCE($2, vehicle_model),
-          vehicle_number = COALESCE($3, vehicle_number),
-          updated_at = NOW()
-         WHERE user_id = $4`,
-        [vehicle_type, vehicle_model, vehicle_number, authReq.user!.id]
-      );
-    }
-
-    await db.query("COMMIT");
     return sendSuccess(res, { message: "Profile updated successfully." });
   } catch (error: any) {
-    await db.query("ROLLBACK");
     return sendError(res, "UPDATE_ERROR", error.message);
   }
-});
-
-/**
- * POST /api/rider/documents
- */
-router.post("/documents", async (req: Request, res: Response) => {
-  return sendSuccess(res, { message: "Documents received and pending admin approval." });
 });
 
 /**
@@ -466,7 +482,9 @@ router.post("/jobs/:id/complete", async (req: Request, res: Response) => {
 router.get("/vehicle", async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
   try {
-    const vehicles = await db.query("SELECT * FROM rider_vehicles WHERE rider_id = $1", [authReq.user!.id]);
+    const riderProfileId = await resolveRiderProfileId(authReq.user!.id);
+    if (!riderProfileId) return sendError(res, "PROFILE_MISSING", "Rider profile not found.", 404);
+    const vehicles = await db.query("SELECT * FROM rider_vehicles WHERE rider_id = $1", [riderProfileId]);
     return sendSuccess(res, { vehicle: vehicles[0] || null });
   } catch (error: any) {
     return sendError(res, "FETCH_FAILED", error.message);
@@ -480,18 +498,44 @@ router.post("/vehicle", async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
   const { make_model, color, license_plate, year, vehicle_category, registration_number, ownership_status, registration_document_url, vehicle_images } = req.body;
   try {
-    const existing = await db.query("SELECT id FROM rider_vehicles WHERE rider_id = $1", [authReq.user!.id]);
+    const riderProfileId = await resolveRiderProfileId(authReq.user!.id);
+    if (!riderProfileId) return sendError(res, "PROFILE_MISSING", "Rider profile not found.", 404);
+
+    const existing = await db.query("SELECT id FROM rider_vehicles WHERE rider_id = $1", [riderProfileId]);
     if (existing.length > 0) {
+      // Registration is a two-step flow: VehicleDetailsScreen sends make/
+      // model/color/etc, then VehicleDocumentsScreen sends only
+      // registration_document_url/vehicle_images. Without COALESCE on every
+      // column, that second call would overwrite all the vehicle details
+      // from the first call with NULL, since they're undefined in that
+      // request body.
       await db.query(
-        `UPDATE rider_vehicles SET make_model=$1, color=$2, license_plate=$3, year=$4, vehicle_category=$5, registration_number=$6, ownership_status=$7, registration_document_url=COALESCE($8, registration_document_url), vehicle_images=COALESCE($9, vehicle_images), verification_status='pending' WHERE rider_id=$10`,
-        [make_model, color, license_plate, year, vehicle_category, registration_number, ownership_status, registration_document_url, vehicle_images, authReq.user!.id]
+        `UPDATE rider_vehicles SET
+          make_model = COALESCE($1, make_model),
+          color = COALESCE($2, color),
+          license_plate = COALESCE($3, license_plate),
+          year = COALESCE($4, year),
+          vehicle_category = COALESCE($5, vehicle_category),
+          type = COALESCE($5, type),
+          registration_number = COALESCE($6, registration_number),
+          ownership_status = COALESCE($7, ownership_status),
+          registration_document_url = COALESCE($8, registration_document_url),
+          vehicle_images = COALESCE($9, vehicle_images),
+          verification_status = 'pending'
+         WHERE rider_id = $10`,
+        [make_model, color, license_plate, year, vehicle_category, registration_number, ownership_status, registration_document_url, vehicle_images, riderProfileId]
       );
     } else {
+      // type is NOT NULL with no default, but neither this route nor any
+      // frontend screen ever populated it — every first-time vehicle save
+      // failed outright. vehicle_category (bike/car/rickshaw/ambulance,
+      // matching rider_profiles.vehicle_type's vocabulary) is the closest
+      // real signal available, so it backs both columns.
       const vid = "veh_" + Math.random().toString(36).substring(2, 10);
       await db.query(
-        `INSERT INTO rider_vehicles (id, rider_id, make_model, color, license_plate, year, vehicle_category, registration_number, ownership_status, registration_document_url, vehicle_images)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-        [vid, authReq.user!.id, make_model, color, license_plate, year, vehicle_category, registration_number, ownership_status, registration_document_url, vehicle_images]
+        `INSERT INTO rider_vehicles (id, rider_id, make_model, color, license_plate, year, vehicle_category, type, registration_number, ownership_status, registration_document_url, vehicle_images)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9, $10, $11)`,
+        [vid, riderProfileId, make_model, color, license_plate, year, vehicle_category, registration_number, ownership_status, registration_document_url, vehicle_images]
       );
     }
     return sendSuccess(res, { message: "Vehicle details updated successfully." });
@@ -506,7 +550,9 @@ router.post("/vehicle", async (req: Request, res: Response) => {
 router.get("/documents", async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
   try {
-    const docs = await db.query("SELECT * FROM rider_documents WHERE rider_id = $1", [authReq.user!.id]);
+    const riderProfileId = await resolveRiderProfileId(authReq.user!.id);
+    if (!riderProfileId) return sendError(res, "PROFILE_MISSING", "Rider profile not found.", 404);
+    const docs = await db.query("SELECT * FROM rider_documents WHERE rider_id = $1", [riderProfileId]);
     return sendSuccess(res, { documents: docs });
   } catch (error: any) {
     return sendError(res, "FETCH_FAILED", error.message);
@@ -520,7 +566,10 @@ router.post("/documents", async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
   const { document_type, file_url } = req.body;
   try {
-    const existing = await db.query("SELECT id FROM rider_documents WHERE rider_id = $1 AND document_type = $2", [authReq.user!.id, document_type]);
+    const riderProfileId = await resolveRiderProfileId(authReq.user!.id);
+    if (!riderProfileId) return sendError(res, "PROFILE_MISSING", "Rider profile not found.", 404);
+
+    const existing = await db.query("SELECT id FROM rider_documents WHERE rider_id = $1 AND document_type = $2", [riderProfileId, document_type]);
     if (existing.length > 0) {
       await db.query(
         "UPDATE rider_documents SET file_url = $1, status = 'pending_review' WHERE id = $2",
@@ -530,7 +579,7 @@ router.post("/documents", async (req: Request, res: Response) => {
       const did = "doc_" + Math.random().toString(36).substring(2, 10);
       await db.query(
         "INSERT INTO rider_documents (id, rider_id, document_type, file_url) VALUES ($1, $2, $3, $4)",
-        [did, authReq.user!.id, document_type, file_url]
+        [did, riderProfileId, document_type, file_url]
       );
     }
     return sendSuccess(res, { message: "Document uploaded successfully." });

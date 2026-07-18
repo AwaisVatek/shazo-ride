@@ -546,8 +546,11 @@ router.post("/:id/rate", requireAuth, async (req: Request, res: Response) => {
       return sendError(res, "NO_DRIVER", "No rider is assigned to this reservation history.", 400);
     }
 
-    // Persist the score on the ride itself, and roll it into the driver's aggregate rating
-    await db.query("UPDATE ride_bookings SET rider_rating = $1, updated_at = NOW() WHERE id = $2", [score, rideId]);
+    // Persist the score AND the free-text review directly on the ride itself,
+    // and roll the score into the driver's aggregate rating. Previously the
+    // review text only went into audit_logs as an unstructured string, so it
+    // could never be shown back to the customer on their own ride receipt.
+    await db.query("UPDATE ride_bookings SET rider_rating = $1, rider_review = $2, updated_at = NOW() WHERE id = $3", [score, review || null, rideId]);
     await db.query(
       `UPDATE rider_profiles SET rating = (
          SELECT AVG(rider_rating) FROM ride_bookings WHERE rider_id = $1 AND rider_rating IS NOT NULL
@@ -555,15 +558,13 @@ router.post("/:id/rate", requireAuth, async (req: Request, res: Response) => {
       [rider_id]
     );
 
-    // Keep the free-text review as an audit log — there's no dedicated review column on ride_bookings
-    if (review) {
-      const ratingId = "rat_" + crypto.randomUUID().slice(0, 8);
-      await db.query(
-        `INSERT INTO audit_logs (id, user_id, role, action, target_table, target_id, notes)
-         VALUES ($1, $2, 'customer', 'rate_ride_journey', 'ride_bookings', $3, $4)`,
-        [ratingId, authUser.id, rideId, `Score ${score}/5 posted for driver ${rider_id}. Review: ${review}`]
-      );
-    }
+    // Still log it as an audit entry too, for ops visibility alongside other actions.
+    const ratingId = "rat_" + crypto.randomUUID().slice(0, 8);
+    await db.query(
+      `INSERT INTO audit_logs (id, user_id, role, action, target_table, target_id, notes)
+       VALUES ($1, $2, 'customer', 'rate_ride_journey', 'ride_bookings', $3, $4)`,
+      [ratingId, authUser.id, rideId, `Score ${score}/5 posted for driver ${rider_id}.${review ? ` Review: ${review}` : ''}`]
+    );
 
     return sendSuccess(res, { message: "Thank you! Your feedback has been logged cleanly." });
 

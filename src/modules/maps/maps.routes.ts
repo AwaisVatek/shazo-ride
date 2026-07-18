@@ -228,16 +228,49 @@ router.post("/geocode", requireAuth, async (req: Request, res: Response) => {
   }
 });
 
+// How close a local landmark needs to be to a dropped pin before we trust it
+// as "this is what the pin is on", rather than just "the nearest thing we
+// happen to have". Tight enough that a genuinely wrong address never wins.
+const REVERSE_GEOCODE_RADIUS_METERS = 60;
+
+async function findNearestLandmark(lat: number, lng: number): Promise<{ address: string } | null> {
+  try {
+    const rows = await db.query<any>(
+      `SELECT *, (111320 * SQRT(POWER(lat - $1, 2) + POWER((lng - $2) * COS(RADIANS($1)), 2))) AS distance_m
+       FROM landmarks
+       ORDER BY distance_m ASC
+       LIMIT 1`,
+      [lat, lng]
+    );
+    const nearest = rows[0];
+    if (!nearest || Number(nearest.distance_m) > REVERSE_GEOCODE_RADIUS_METERS) return null;
+    return { address: nearest.address ? `${nearest.name}, ${nearest.address}` : nearest.name };
+  } catch (e) {
+    return null;
+  }
+}
+
 router.post("/reverse-geocode", requireAuth, async (req: Request, res: Response) => {
   const { latitude, longitude } = req.body;
   if (latitude === undefined || longitude === undefined) {
     return sendError(res, "VALIDATION_FAILED", "Both latitude and longitude are needed.");
   }
-  if (!verifyMapboxKey(res)) return;
 
   const coordStr = `${latitude},${longitude}`;
 
   try {
+    // Our own address/landmark data (137k+ rows from a real Karachi OSM
+    // extract) is checked first — Mapbox's reverse geocoding for Karachi
+    // tends to resolve to a generic "Karachi, Sindh, Pakistan"-level result
+    // rather than the actual street/building under the pin. Only fall back
+    // to Mapbox if nothing local is close enough to trust.
+    const localMatch = await findNearestLandmark(latitude, longitude);
+    if (localMatch) {
+      return sendSuccess(res, { address: localMatch.address, latitude, longitude, source: "local" });
+    }
+
+    if (!verifyMapboxKey(res)) return;
+
     let cached: any[] = [];
     try {
       cached = await db.query("SELECT response_json FROM geocode_cache WHERE address_or_coords = $1", [coordStr]);
@@ -260,7 +293,8 @@ router.post("/reverse-geocode", requireAuth, async (req: Request, res: Response)
     const output = {
       address: body.features[0].place_name,
       latitude,
-      longitude
+      longitude,
+      source: "mapbox"
     };
 
     await db.query(

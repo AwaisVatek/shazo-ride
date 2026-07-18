@@ -297,6 +297,24 @@ router.get("/wallet", async (req: Request, res: Response) => {
 });
 
 /**
+ * GET /api/customer/wallet/payment-accounts
+ * The active bank/mobile-wallet channels a customer can send a manual
+ * transfer to. Previously only exposed via an admin-only route — customers
+ * had no way to actually see which account to send money to before
+ * submitting a top-up request with a transaction ID.
+ */
+router.get("/wallet/payment-accounts", async (req: Request, res: Response) => {
+  try {
+    const accounts = await db.query(
+      "SELECT id, account_type, bank_name, account_title, account_number, instructions FROM manual_payment_accounts WHERE is_active = true ORDER BY display_order ASC"
+    );
+    return sendSuccess(res, { accounts });
+  } catch (err: any) {
+    return sendError(res, "FETCH_PAYMENT_ACCOUNTS_FAILED", err.message);
+  }
+});
+
+/**
  * POST /api/customer/wallet/topup
  * Files a manual top-up request — credited only after admin approval (see
  * PATCH /api/finance/customer-topups/:id).
