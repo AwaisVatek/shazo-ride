@@ -1,8 +1,9 @@
 import cors from "cors";
 import dotenv from "dotenv";
 import { createServer } from "http";
-import { Server } from "socket.io";
+import { Server, Socket } from "socket.io";
 import crypto from "crypto";
+import jwt from "jsonwebtoken";
 dotenv.config();
 
 import { app } from "./express_app";
@@ -20,20 +21,74 @@ export const io = new Server(httpServer, {
   }
 });
 
+interface AuthedSocket extends Socket {
+  data: { user?: { id: string; role: string } };
+}
+
+// Every socket connection previously had NO authentication at all — both
+// apps already send a JWT via `socket.auth = { token }` before connecting
+// (confirmed in each app's api/client.ts), but the server never read it.
+// Concretely, this meant: any client could join ANY rideId's room and both
+// read live location/chat and post chat messages under a spoofed
+// senderId/senderRole for a ride they had nothing to do with, and a rider
+// disconnecting (app killed, crash, connection loss) never got marked
+// offline server-side — a "ghost rider" staying is_online=true forever
+// until they happened to reopen the app and manually toggle offline.
+io.use((socket, next) => {
+  const token = socket.handshake.auth?.token;
+  if (!token) {
+    return next(new Error("UNAUTHORIZED"));
+  }
+  try {
+    const decoded = jwt.verify(token, config.JWT_SECRET) as { userId: string; role: string };
+    (socket as AuthedSocket).data.user = { id: decoded.userId, role: decoded.role };
+    next();
+  } catch (err) {
+    next(new Error("UNAUTHORIZED"));
+  }
+});
+
+async function markRiderOffline(userId: string) {
+  try {
+    await db.query("UPDATE rider_profiles SET is_online = false, updated_at = NOW() WHERE user_id = $1", [userId]);
+  } catch (err) {
+    console.error("Failed to mark rider offline on disconnect:", err);
+  }
+}
+
+async function canAccessRide(userId: string, role: string, rideId: string): Promise<boolean> {
+  if (role === "admin" || role === "operations_manager") return true;
+  try {
+    const rows = await db.query(
+      "SELECT 1 FROM ride_bookings WHERE id = $1 AND (customer_id = $2 OR rider_id = $2)",
+      [rideId, userId]
+    );
+    return rows.length > 0;
+  } catch (err) {
+    return false;
+  }
+}
+
 // Setup basic Socket.io events
-io.on("connection", (socket) => {
-  console.log(`🔌 Client connected: ${socket.id}`);
-  
+io.on("connection", (socket: AuthedSocket) => {
+  const user = socket.data.user!;
+  console.log(`🔌 Client connected: ${socket.id} (user=${user.id}, role=${user.role})`);
+
   // A driver joins a specific room to receive nearby requests
   socket.on("join_driver_pool", () => {
+    if (user.role !== "rider") return;
     socket.join("driver_pool");
     console.log(`Driver joined pool: ${socket.id}`);
   });
 
-  // A customer joins their own room to listen for driver bids
-  socket.on("join_ride", (rideId) => {
+  // A customer or rider joins their own ride's room — only if they're
+  // actually a party to that ride, not any arbitrary rideId.
+  socket.on("join_ride", async (rideId) => {
+    if (typeof rideId !== "string" || !(await canAccessRide(user.id, user.role, rideId))) {
+      return;
+    }
     socket.join(rideId);
-    console.log(`Customer joined ride tracking: ${rideId}`);
+    console.log(`${user.role} ${user.id} joined ride tracking: ${rideId}`);
   });
 
   // A customer joins their ambulance dispatch's room to receive status updates
@@ -42,21 +97,26 @@ io.on("connection", (socket) => {
     console.log(`Customer joined ambulance tracking: ${requestId}`);
   });
 
-  // Chat message system for an active ride
-  socket.on("send_message", async (data: { rideId: string, senderId: string, senderRole: string, content: string }) => {
+  // Chat message system for an active ride — sender identity comes from the
+  // authenticated socket, never trusted from the client payload (previously
+  // any connected client could post as any senderId/senderRole).
+  socket.on("send_message", async (data: { rideId: string, content: string }) => {
     try {
+      if (typeof data?.rideId !== "string" || !(await canAccessRide(user.id, user.role, data.rideId))) {
+        return;
+      }
       const msgId = "msg_" + crypto.randomUUID().slice(0, 8);
       await db.query(
         "INSERT INTO ride_messages (id, ride_id, sender_id, sender_role, content) VALUES ($1, $2, $3, $4, $5)",
-        [msgId, data.rideId, data.senderId, data.senderRole, data.content]
+        [msgId, data.rideId, user.id, user.role, data.content]
       );
-      
+
       // Broadcast to everyone in the room
       io.to(data.rideId).emit("receive_message", {
         id: msgId,
         ride_id: data.rideId,
-        sender_id: data.senderId,
-        sender_role: data.senderRole,
+        sender_id: user.id,
+        sender_role: user.role,
         content: data.content,
         created_at: new Date().toISOString()
       });
@@ -66,7 +126,10 @@ io.on("connection", (socket) => {
   });
 
   socket.on("disconnect", () => {
-    console.log(`🔌 Client disconnected: ${socket.id}`);
+    console.log(`🔌 Client disconnected: ${socket.id} (user=${user.id})`);
+    if (user.role === "rider") {
+      markRiderOffline(user.id);
+    }
   });
 });
 

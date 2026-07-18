@@ -187,12 +187,13 @@ router.get("/me", async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
   try {
     const userRows = await db.query(
-      `SELECT u.id, u.full_name, u.phone, u.email, u.avatar_url as profile_image_url, 
-              rp.vehicle_type, rp.vehicle_model, rp.vehicle_number, rp.is_verified as docs_verified, rp.is_online
+      `SELECT u.id, u.full_name, u.phone, u.email, u.avatar_url as profile_image_url,
+              rp.vehicle_type, rp.vehicle_model, rp.vehicle_number, rp.city, rp.cnic, rp.license_expiry,
+              rp.verification_status, rp.rejection_reason, (rp.verification_status = 'verified') as docs_verified, rp.is_online
        FROM users u
        LEFT JOIN rider_profiles rp ON u.id = rp.user_id
        WHERE u.id = $1`,
-      [authReq.user!.id] // Fixed `req.user!.id` references for JWT setup
+      [authReq.user!.id]
     );
 
     if (userRows.length === 0) {
@@ -320,9 +321,16 @@ router.patch("/location", async (req: Request, res: Response) => {
  */
 router.get("/status", async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
-  const rows = await db.query("SELECT is_online, is_verified FROM rider_profiles WHERE user_id = $1", [authReq.user!.id]);
+  // rider_profiles has no is_verified column at all — this threw "column
+  // does not exist" on every single call. verification_status ('pending' /
+  // 'verified' / 'rejected') is the real, only source of verification state.
+  const rows = await db.query("SELECT is_online, verification_status FROM rider_profiles WHERE user_id = $1", [authReq.user!.id]);
   if (rows.length === 0) return sendError(res, "NOT_FOUND", "Profile missing");
-  return sendSuccess(res, rows[0]);
+  return sendSuccess(res, {
+    is_online: rows[0].is_online,
+    verification_status: rows[0].verification_status,
+    is_verified: rows[0].verification_status === "verified"
+  });
 });
 
 // --- RIDER JOBS LIFECYCLE ---

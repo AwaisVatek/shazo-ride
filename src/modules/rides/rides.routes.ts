@@ -55,9 +55,15 @@ router.post("/estimate", requireAuth, async (req: Request, res: Response) => {
     if (distResponse && distResponse.ok) {
       try {
         const distBody: any = await distResponse.json();
-        if (distBody.ok) {
-          distance_km = distBody.data.distance_km;
-          duration_minutes = distBody.data.duration_minutes;
+        // /api/maps/distance actually returns
+        // { distance: { text, value(meters) }, duration: { text, value(seconds) } } —
+        // reading distance_km/duration_minutes directly (fields that don't
+        // exist on this shape) silently produced `undefined` here, which
+        // cascaded into NaN fare math and a null-filled /estimate response
+        // (the blank "PKR" on the booking screen) on every single request.
+        if (distBody.ok && distBody.data?.distance?.value != null && distBody.data?.duration?.value != null) {
+          distance_km = distBody.data.distance.value / 1000;
+          duration_minutes = distBody.data.duration.value / 60;
         } else {
           throw new Error("API returned not ok");
         }
@@ -65,7 +71,7 @@ router.post("/estimate", requireAuth, async (req: Request, res: Response) => {
         distResponse = null; // force fallback
       }
     }
-    
+
     if (!distResponse || !distResponse.ok) {
       // Fallback: Haversine straight-line distance if Maps API fails
       const R = 6371; // Earth radius in km
@@ -189,9 +195,14 @@ router.post("/request", requireAuth, async (req: AuthenticatedRequest, res: Resp
     if (statsResponse && statsResponse.ok) {
       try {
         const statsJson: any = await statsResponse.json();
-        if (statsJson.ok) {
-          distance_km = statsJson.data.distance_km;
-          duration_minutes = statsJson.data.duration_minutes;
+        // Same real shape as /estimate's identical self-fetch:
+        // { distance: { value(meters) }, duration: { value(seconds) } } — not
+        // distance_km/duration_minutes. This previously wrote `undefined`
+        // straight into ride_bookings.distance_km/duration_minutes on every
+        // booking.
+        if (statsJson.ok && statsJson.data?.distance?.value != null && statsJson.data?.duration?.value != null) {
+          distance_km = statsJson.data.distance.value / 1000;
+          duration_minutes = statsJson.data.duration.value / 60;
         } else {
           throw new Error("API returned not ok");
         }
@@ -211,10 +222,18 @@ router.post("/request", requireAuth, async (req: AuthenticatedRequest, res: Resp
       duration_minutes = Math.max(5, distance_km * 3);
     }
 
-    // 3. Compute proper fare from defaults or honor user's proposed bid
+    // 3. Compute proper fare from defaults or honor user's proposed bid.
+    // ride_bookings has no "ride_type" column — real columns are
+    // service_type/vehicle_category (both set to the same value here, since
+    // there's no finer sub-category yet) plus a negotiation-oriented set:
+    // system_estimated_fare (what our pricing engine recommends),
+    // customer_offer_fare (what the customer actually proposed), and a plain
+    // `fare` that always mirrors "the current effective price" for this ride
+    // — the customer's offer until a rider's counter-offer is accepted.
     let fare = proposed_fare ? Number(proposed_fare) : 150;
+    let estimatedFare = fare;
     let min_fare = 0;
-    
+
     let estResponse: any = null;
     try {
       estResponse = await fetch(`${config.API_BASE_URL}/api/rides/estimate`, {
@@ -235,6 +254,7 @@ router.post("/request", requireAuth, async (req: AuthenticatedRequest, res: Resp
         const match = estJson.data.estimates.find((e: any) => e.service_type === ride_type);
         if (match) {
           min_fare = match.minimum_fare;
+          estimatedFare = match.recommended_fare;
           if (!proposed_fare) fare = match.recommended_fare;
         }
       }
@@ -252,9 +272,9 @@ router.post("/request", requireAuth, async (req: AuthenticatedRequest, res: Resp
     // 4. Save to Database
     const rideId = "rid_" + crypto.randomUUID().slice(0, 8);
     await db.query(
-      `INSERT INTO ride_bookings (id, customer_id, pickup_address, pickup_lat, pickup_lng, dropoff_address, dropoff_lat, dropoff_lng, distance_km, duration_minutes, ride_type, fare, minimum_fare, commission_amount, payment_method, promo_code_used, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'requested')`,
-      [rideId, req.user!.id, pickup_address, pickup_lat, pickup_lng, dropoff_address, dropoff_lat, dropoff_lng, distance_km, duration_minutes, ride_type, fare, min_fare, commission, payment_method || "cash", promo_code || null]
+      `INSERT INTO ride_bookings (id, customer_id, pickup_address, pickup_lat, pickup_lng, dropoff_address, dropoff_lat, dropoff_lng, distance_km, duration_minutes, service_type, vehicle_category, fare, system_estimated_fare, customer_offer_fare, minimum_fare, commission_amount, payment_method, promo_code_used, negotiation_status, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, 'pending', 'requested')`,
+      [rideId, req.user!.id, pickup_address, pickup_lat, pickup_lng, dropoff_address, dropoff_lat, dropoff_lng, distance_km, duration_minutes, ride_type, ride_type, fare, estimatedFare, proposed_fare ? fare : null, min_fare, commission, payment_method || "cash", promo_code || null]
     );
 
     // Initial status logs trail
@@ -309,17 +329,87 @@ router.post("/offer-fare", requireAuth, async (req: AuthenticatedRequest, res: R
       [offerId, ride_id, req.user!.role, req.user!.id, proposed_fare, isCounter]
     );
 
-    // Alert the customer that a driver proposed a bid
+    // Reflect the latest counter directly on the ride row too, so anything
+    // reading ride_bookings (not just the socket event) sees it.
+    await db.query(
+      `UPDATE ride_bookings SET rider_counter_fare = $1, negotiation_status = 'countered', updated_at = NOW() WHERE id = $2`,
+      [proposed_fare, ride_id]
+    );
+
+    // Alert the customer that a driver proposed a bid — real aggregate
+    // rating from rider_profiles, not a placeholder.
+    const riderProfile = await db.query("SELECT rating FROM rider_profiles WHERE user_id = $1", [req.user!.id]);
     io.to(ride_id).emit("new_driver_offer", {
       offerId,
       proposed_fare,
-      driver: { id: req.user!.id, name: req.user!.full_name, rating: 4.8 } // Mock rating
+      driver: {
+        id: req.user!.id,
+        name: req.user!.full_name,
+        rating: riderProfile.length > 0 && riderProfile[0].rating != null ? Number(riderProfile[0].rating) : null
+      }
     });
 
     return sendSuccess(res, { offerId, message: "Bidding transaction compiled successfully." }, 201);
 
   } catch (err: any) {
     return sendError(res, "OFFER_CREATION_FAILED", err.message, 500);
+  }
+});
+
+/**
+ * POST /api/rides/:id/accept-offer
+ * Customer accepts one rider's counter-offer, finalizing the negotiation:
+ * assigns that rider to the ride and settles the fare. Was called by the
+ * customer app's ActiveRideScreen but never existed on the backend at all —
+ * accepting any driver's bid was a dead action.
+ */
+router.post("/:id/accept-offer", requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const rideId = req.params.id;
+  const { offer_id } = req.body;
+  if (!offer_id) {
+    return sendError(res, "VALIDATION_FAILED", "Please provide an offer_id to accept.");
+  }
+
+  try {
+    const rides = await db.query("SELECT * FROM ride_bookings WHERE id = $1 AND customer_id = $2", [rideId, req.user!.id]);
+    if (rides.length === 0) {
+      return sendError(res, "RIDE_NOT_FOUND", "No matching ride found for this customer.", 404);
+    }
+    if (rides[0].status !== "requested") {
+      return sendError(res, "INVALID_STATE", `Cannot accept an offer while the ride is '${rides[0].status}'.`, 400);
+    }
+
+    const offers = await db.query("SELECT * FROM ride_offers WHERE id = $1 AND ride_id = $2 AND status = 'pending'", [offer_id, rideId]);
+    if (offers.length === 0) {
+      return sendError(res, "OFFER_NOT_FOUND", "This offer is no longer available.", 404);
+    }
+    const offer = offers[0];
+
+    await db.transaction(async (client) => {
+      await client.query(
+        `UPDATE ride_bookings SET
+           status = 'accepted',
+           rider_id = $1,
+           accepted_fare = $2,
+           fare = $2,
+           negotiation_status = 'accepted',
+           updated_at = NOW()
+         WHERE id = $3`,
+        [offer.offerer_id, offer.proposed_fare, rideId]
+      );
+      await client.query("UPDATE ride_offers SET status = 'accepted' WHERE id = $1", [offer_id]);
+      // Any other rider's pending bid on this ride is now moot.
+      await client.query(
+        "UPDATE ride_offers SET status = 'rejected' WHERE ride_id = $1 AND id != $2 AND status = 'pending'",
+        [rideId, offer_id]
+      );
+    });
+
+    io.to(rideId).emit("ride_update", { rideId, status: "accepted" });
+
+    return sendSuccess(res, { message: "Offer accepted. A rider has been assigned to this ride." });
+  } catch (err: any) {
+    return sendError(res, "ACCEPT_OFFER_FAILED", err.message, 500);
   }
 });
 

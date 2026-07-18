@@ -21,6 +21,52 @@ function verifyMapboxKey(res: Response): boolean {
   return true;
 }
 
+// Mapbox's raw place_name is the full administrative chain ("Gulshan-E-
+// Iqbal, Karachi, Karachi East, Sindh, Pakistan") and, without an explicit
+// language, mixes in Urdu-script admin names (confirmed live: a district
+// came back as "کراچی مشرقی" instead of "Karachi East") — both are fixed
+// by requesting &language=en on every Mapbox geocoding call and normalizing
+// down to the specific place name plus at most one area-level qualifier,
+// never region/country/district.
+function normalizeMapboxAddress(feature: any): string {
+  const primary: string = feature.text;
+  const placeType = feature.place_type?.[0];
+
+  // The feature itself is already an area-level name (a neighborhood, a
+  // locality, or a city-scale "place") — that's exactly the specificity
+  // wanted (e.g. "Bahadurabad", "Gulshan-E-Iqbal"); no admin suffix needed.
+  if (["neighborhood", "locality", "place"].includes(placeType)) {
+    return primary;
+  }
+
+  // A narrower feature (a POI or a street address) gets one level of area
+  // context for clarity — never a district/region/country.
+  const context = Array.isArray(feature.context) ? feature.context : [];
+  const areaContext = context.find((c: any) =>
+    typeof c.id === "string" &&
+    (c.id.startsWith("neighborhood.") || c.id.startsWith("locality.") || c.id.startsWith("place."))
+  );
+  if (areaContext?.text && areaContext.text !== primary) {
+    return `${primary}, ${areaContext.text}`;
+  }
+  return primary;
+}
+
+// Unnamed "addresses"-category rows had their `name` synthesized directly
+// from address components at import time (see import-karachi-landmarks.ts),
+// so `name` and `address` are often identical or one a prefix of the other.
+// Naively joining them ("X, X, Karachi") produced visibly duplicated text —
+// confirmed live against a real coordinate. Collapse to whichever of the two
+// is the more complete string instead of always concatenating both.
+function combineNameAndAddress(name: string, address: string | null | undefined): string {
+  if (!address) return name;
+  const n = name.trim().toLowerCase();
+  const a = address.trim().toLowerCase();
+  if (a === n || a.startsWith(n)) return address;
+  if (n.startsWith(a)) return name;
+  return `${name}, ${address}`;
+}
+
 function toPrediction(feature: any) {
   const secondary = typeof feature.place_name === "string" && typeof feature.text === "string"
     ? feature.place_name.replace(feature.text + ", ", "")
@@ -49,7 +95,7 @@ const KARACHI_CENTER = { lat: 24.8607, lng: 67.0011 };
 function toLandmarkPrediction(row: any) {
   return {
     place_id: row.id,
-    description: row.address ? `${row.name}, ${row.address}` : row.name,
+    description: combineNameAndAddress(row.name, row.address),
     geometry: { location: { lat: Number(row.lat), lng: Number(row.lng) } },
     structured_formatting: {
       main_text: row.name,
@@ -84,11 +130,28 @@ async function searchLocalLandmarks(query: string, lat?: number, lng?: number): 
     conditions.push(`(LOWER(name) LIKE $${idx} OR LOWER(COALESCE(address, '')) LIKE $${idx})`);
   });
 
+  // Real categories in this dataset (confirmed via information_schema/data):
+  // addresses, streets_and_lanes, landmarks, districts_and_zones, hospitals —
+  // no separate POI/commercial/university/restaurant buckets exist (OSM
+  // tags most of those as `landmarks` already). Ranks landmarks/hospitals
+  // (named, specific places) above broad districts/streets, which in turn
+  // rank above generic street-address rows — but only as a tie-breaker
+  // after exact/prefix name relevance, so "Bahadurabad Chowrangi" still
+  // beats an unrelated "addresses" row that merely contains the word.
+  const CATEGORY_RANK = `CASE category
+    WHEN 'landmarks' THEN 1
+    WHEN 'hospitals' THEN 2
+    WHEN 'districts_and_zones' THEN 3
+    WHEN 'streets_and_lanes' THEN 4
+    WHEN 'addresses' THEN 5
+    ELSE 6
+  END`;
+
   const hasCoords = lat !== undefined && lng !== undefined && !isNaN(lat) && !isNaN(lng);
   let orderBy = `
     (LOWER(name) = $1) DESC,
     (LOWER(name) LIKE $2) DESC,
-    (category = 'addresses') ASC
+    ${CATEGORY_RANK} ASC
   `;
   if (hasCoords) {
     params.push(lat, lng);
@@ -141,7 +204,7 @@ router.get("/autocomplete", requireAuth, async (req: Request, res: Response) => 
       // aren't crowded out by street/place results; proximity ranks results
       // near the caller (or Karachi center) higher instead of relying on bbox
       // alone; limit raised from 5 to 10 for more landmark coverage.
-      const url = `${MAPBOX_GEOCODING_BASE}/${encodeURIComponent(query)}.json?access_token=${config.MAPBOX_API_KEY}&autocomplete=true&limit=10&bbox=${KARACHI_BBOX}&country=pk&proximity=${proximity}&types=poi,address,place,neighborhood,locality`;
+      const url = `${MAPBOX_GEOCODING_BASE}/${encodeURIComponent(query)}.json?access_token=${config.MAPBOX_API_KEY}&autocomplete=true&limit=10&bbox=${KARACHI_BBOX}&country=pk&proximity=${proximity}&types=poi,address,place,neighborhood,locality&language=en`;
       const apiResponse = await fetch(url);
       if (!apiResponse.ok) {
         throw new Error(`Mapbox Autocomplete failed with status code ${apiResponse.status}`);
@@ -198,7 +261,7 @@ router.post("/geocode", requireAuth, async (req: Request, res: Response) => {
       return sendSuccess(res, JSON.parse(cached[0].response_json));
     }
 
-    const url = `${MAPBOX_GEOCODING_BASE}/${encodeURIComponent(address)}.json?access_token=${config.MAPBOX_API_KEY}&limit=1&bbox=${KARACHI_BBOX}&country=pk&proximity=${KARACHI_CENTER.lng},${KARACHI_CENTER.lat}&types=poi,address,place,neighborhood,locality`;
+    const url = `${MAPBOX_GEOCODING_BASE}/${encodeURIComponent(address)}.json?access_token=${config.MAPBOX_API_KEY}&limit=1&bbox=${KARACHI_BBOX}&country=pk&proximity=${KARACHI_CENTER.lng},${KARACHI_CENTER.lat}&types=poi,address,place,neighborhood,locality&language=en`;
     const response = await fetch(url);
     if (!response.ok) {
       throw new Error(`Mapbox Geocoding failed with status code ${response.status}`);
@@ -211,7 +274,7 @@ router.post("/geocode", requireAuth, async (req: Request, res: Response) => {
 
     const f = body.features[0];
     const output = {
-      address: f.place_name,
+      address: normalizeMapboxAddress(f),
       latitude: f.center[1],
       longitude: f.center[0]
     };
@@ -233,18 +296,34 @@ router.post("/geocode", requireAuth, async (req: Request, res: Response) => {
 // happen to have". Tight enough that a genuinely wrong address never wins.
 const REVERSE_GEOCODE_RADIUS_METERS = 60;
 
+// Some raw OSM `name` tags in the imported dataset were captured in Urdu
+// script rather than English/Romanized text (e.g. a street literally named
+// "اسٹریٹ ای" — Urdu for "Street E") — confirmed live. Detects Arabic-script
+// text (Urdu uses the Arabic block plus a few Arabic Extended-A letters) so
+// such rows can be skipped in favor of a real English name from elsewhere,
+// rather than ever surfacing Urdu script into what should be an
+// English-normalized address.
+const ARABIC_SCRIPT_RE = /[؀-ۿݐ-ݿ]/;
+
 async function findNearestLandmark(lat: number, lng: number): Promise<{ address: string } | null> {
   try {
     const rows = await db.query<any>(
       `SELECT *, (111320 * SQRT(POWER(lat - $1, 2) + POWER((lng - $2) * COS(RADIANS($1)), 2))) AS distance_m
        FROM landmarks
        ORDER BY distance_m ASC
-       LIMIT 1`,
+       LIMIT 5`,
       [lat, lng]
     );
-    const nearest = rows[0];
+    // Pick the nearest candidate with a usable (non-Urdu-script) name AND
+    // address within radius — a row can have an English `name` but a
+    // Urdu-script `address` (or vice versa), and combineNameAndAddress()
+    // below surfaces both, so either field alone leaking through still
+    // produced Urdu text in the final result. Skip a closer Urdu-tainted row
+    // in favor of a slightly farther, fully-English one, or fall through to
+    // Mapbox if none qualify.
+    const nearest = rows.find((r: any) => !ARABIC_SCRIPT_RE.test(r.name) && !ARABIC_SCRIPT_RE.test(r.address || ""));
     if (!nearest || Number(nearest.distance_m) > REVERSE_GEOCODE_RADIUS_METERS) return null;
-    return { address: nearest.address ? `${nearest.name}, ${nearest.address}` : nearest.name };
+    return { address: combineNameAndAddress(nearest.name, nearest.address) };
   } catch (e) {
     return null;
   }
@@ -279,7 +358,7 @@ router.post("/reverse-geocode", requireAuth, async (req: Request, res: Response)
       return sendSuccess(res, JSON.parse(cached[0].response_json));
     }
 
-    const url = `${MAPBOX_GEOCODING_BASE}/${longitude},${latitude}.json?access_token=${config.MAPBOX_API_KEY}&limit=1`;
+    const url = `${MAPBOX_GEOCODING_BASE}/${longitude},${latitude}.json?access_token=${config.MAPBOX_API_KEY}&limit=1&language=en`;
     const response = await fetch(url);
     if (!response.ok) {
       throw new Error(`Mapbox Reverse Geocoding failed with status code ${response.status}`);
@@ -291,7 +370,7 @@ router.post("/reverse-geocode", requireAuth, async (req: Request, res: Response)
     }
 
     const output = {
-      address: body.features[0].place_name,
+      address: normalizeMapboxAddress(body.features[0]),
       latitude,
       longitude,
       source: "mapbox"
@@ -365,7 +444,7 @@ router.post("/place-autocomplete", requireAuth, async (req: Request, res: Respon
   if (!verifyMapboxKey(res)) return;
 
   try {
-    const url = `${MAPBOX_GEOCODING_BASE}/${encodeURIComponent(address)}.json?access_token=${config.MAPBOX_API_KEY}&autocomplete=true&limit=10&bbox=${KARACHI_BBOX}&country=pk&proximity=${KARACHI_CENTER.lng},${KARACHI_CENTER.lat}&types=poi,address,place,neighborhood,locality`;
+    const url = `${MAPBOX_GEOCODING_BASE}/${encodeURIComponent(address)}.json?access_token=${config.MAPBOX_API_KEY}&autocomplete=true&limit=10&bbox=${KARACHI_BBOX}&country=pk&proximity=${KARACHI_CENTER.lng},${KARACHI_CENTER.lat}&types=poi,address,place,neighborhood,locality&language=en`;
     const apiResponse = await fetch(url);
     if (!apiResponse.ok) throw new Error("Failed");
     const body: any = await apiResponse.json();

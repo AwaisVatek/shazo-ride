@@ -157,7 +157,15 @@ export async function requireWalletEligibleRider(req: Request, res: Response, ne
   }
 
   try {
-    const wallets = await db.query("SELECT balance FROM rider_wallets WHERE rider_id = $1", [authReq.user.id]);
+    // rider_wallets.rider_id references rider_profiles(id), not users.id —
+    // querying by the raw authenticated user id never matched any real
+    // wallet row, so this gate silently passed every rider regardless of
+    // their actual balance (confirmed: wallets.length was always 0).
+    const profileRows = await db.query("SELECT id FROM rider_profiles WHERE user_id = $1", [authReq.user.id]);
+    const riderProfileId = profileRows[0]?.id;
+    const wallets = riderProfileId
+      ? await db.query("SELECT balance FROM rider_wallets WHERE rider_id = $1", [riderProfileId])
+      : [];
     const balance = wallets.length > 0 ? Number(wallets[0].balance) : 0;
 
     // Minimum balance to accept rides on the platform is PKR -100
