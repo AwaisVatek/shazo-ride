@@ -168,6 +168,59 @@ router.post("/food/order", async (req: Request, res: Response) => {
 
 // --- AMBULANCE ---
 /**
+ * POST /api/customer/ambulance/estimate
+ * Precomputes the fare an ambulance request would actually charge, so the
+ * request screen can show a real number (or "Free Service") before the
+ * customer commits — previously there was no way to see this before
+ * submitting. Must compute the exact same number /ambulance/request below
+ * actually charges, not a different formula that could disagree with it.
+ */
+router.post("/ambulance/estimate", async (req: Request, res: Response) => {
+  const { pickup_lat, pickup_lng, hospital_lat, hospital_lng } = req.body;
+
+  if (pickup_lat === undefined || pickup_lng === undefined) {
+    return sendError(res, "VALIDATION_FAILED", "Pickup location is required for an ambulance estimate.");
+  }
+
+  try {
+    const rates = await db.query("SELECT * FROM service_settings WHERE service_type = 'ambulance'");
+    const rate = rates[0];
+    if (!rate) {
+      return sendError(res, "CONFIG_MISSING", "Ambulance service is not currently configured.");
+    }
+    const isFree = !!rate.settings?.free_service_enabled;
+
+    if (isFree) {
+      return sendSuccess(res, { is_free: true, total_fare: 0 });
+    }
+
+    let distanceFare = 0;
+    let totalFare = Number(rate.base_fare ?? 300);
+
+    if (hospital_lat !== undefined && hospital_lng !== undefined) {
+      const route = await computeRoute(pickup_lat, pickup_lng, hospital_lat, hospital_lng);
+      if (route) {
+        distanceFare = Number((route.distanceKm * Number(rate.per_km_rate ?? 0)).toFixed(2));
+        totalFare = Math.max(
+          Number(rate.base_fare ?? 0) + distanceFare,
+          Number(rate.minimum_fare ?? 0)
+        );
+      }
+    }
+
+    return sendSuccess(res, {
+      is_free: false,
+      base_fare: Number(rate.base_fare ?? 0),
+      distance_fare: distanceFare,
+      total_fare: totalFare,
+      minimum_fare: Number(rate.minimum_fare ?? 0),
+    });
+  } catch (err: any) {
+    return sendError(res, "AMBULANCE_ESTIMATE_FAILED", err.message, 500);
+  }
+});
+
+/**
  * POST /api/customer/ambulance/request
  */
 router.post("/ambulance/request", async (req: Request, res: Response) => {
