@@ -1,5 +1,6 @@
 import { Router, Request, Response } from "express";
 import crypto from "crypto";
+import bcrypt from "bcryptjs";
 import { requireAuth, requireAdmin, AuthenticatedRequest } from "../../middleware/auth";
 import { sendSuccess, sendError } from "../../utils/response";
 import { db } from "../../db/index";
@@ -139,14 +140,14 @@ router.get("/riders", async (req: AuthenticatedRequest, res: Response) => {
       rv.license_plate AS vehicle_plate,
       rv.registration_number AS vehicle_number,
       rp.is_online,
-      rp.latitude,
-      rp.latitude AS current_lat,
-      rp.longitude,
-      rp.longitude AS current_lng,
-      rp.last_location_update,
-      rp.last_location_update AS last_location_at,
+      rp.current_lat,
+      rp.current_lat AS latitude,
+      rp.current_lng,
+      rp.current_lng AS longitude,
+      rp.last_location_at,
+      rp.last_location_at AS last_location_update,
       COALESCE(rp.rating, 5.0) AS rating,
-      COALESCE(rp.completed_rides_count, 0) AS total_rides,
+      COALESCE(rp.total_rides, 0) AS total_rides,
 
       COALESCE(rw.balance, 0) AS balance,
       COALESCE(rw.balance, 0) AS wallet_balance
@@ -356,10 +357,13 @@ router.get("/food-orders", async (req: AuthenticatedRequest, res: Response) => {
 });
 
 router.get("/finance/topups", async (req: AuthenticatedRequest, res: Response) => {
+  // mt.rider_id is rider_profiles.id, not users.id — join through the profile
+  // first. Joining users directly on mt.rider_id always returns NULL name/phone.
   const items = await safeRows("topups", `
     SELECT mt.*, u.full_name AS rider_name, u.phone AS rider_phone
     FROM manual_topup_requests mt
-    LEFT JOIN users u ON u.id = mt.rider_id
+    LEFT JOIN rider_profiles rp ON rp.id = mt.rider_id
+    LEFT JOIN users u ON u.id = rp.user_id
     ORDER BY mt.created_at DESC
     LIMIT 100
   `);
@@ -367,8 +371,36 @@ router.get("/finance/topups", async (req: AuthenticatedRequest, res: Response) =
 });
 
 router.post("/finance/topups/:id/approve", async (req: AuthenticatedRequest, res: Response) => {
-  await safeRows("approve topup", "UPDATE manual_topup_requests SET status = 'approved', reviewed_by = $1, reviewed_at = NOW() WHERE id = $2", [req.user!.id, req.params.id]);
-  await safeRows("credit wallet", `UPDATE rider_wallets rw SET balance = rw.balance + mt.amount, updated_at = NOW() FROM manual_topup_requests mt WHERE mt.id = $1 AND rw.rider_id = mt.rider_id`, [req.params.id]);
+  // Atomic guard: only a request still in 'pending' can transition, and only the
+  // request that wins this UPDATE proceeds to credit the wallet — closes a
+  // double-credit hole where retrying/replaying this call credited twice.
+  const claimed = await safeRows(
+    "approve topup",
+    "UPDATE manual_topup_requests SET status = 'approved', reviewed_by = $1, reviewed_at = NOW() WHERE id = $2 AND status = 'pending' RETURNING *",
+    [req.user!.id, req.params.id]
+  );
+  if (claimed.length === 0) {
+    return sendError(res, "ALREADY_PROCESSED", "This top-up was already processed or does not exist.", 400);
+  }
+
+  const tr = claimed[0];
+  const ledgerId = "ledg_" + crypto.randomUUID().slice(0, 8);
+  await safeRows(
+    "upsert wallet",
+    `INSERT INTO rider_wallets (id, rider_id, balance) VALUES ($1, $2, $3)
+     ON CONFLICT (rider_id) DO UPDATE SET balance = rider_wallets.balance + EXCLUDED.balance, updated_at = NOW()`,
+    ["wal_" + crypto.randomUUID().slice(0, 8), tr.rider_id, Number(tr.amount)]
+  );
+  // This endpoint previously credited the wallet with no ledger entry at all —
+  // the wallet-ledger admin view never showed these approvals. Logging it now,
+  // matching the equivalent PATCH /api/finance/topups/:id flow.
+  await safeRows(
+    "log ledger entry",
+    `INSERT INTO rider_wallet_ledger (id, rider_id, amount, transaction_type, reference_id, note)
+     VALUES ($1, $2, $3, 'manual_topup', $4, $5)`,
+    [ledgerId, tr.rider_id, Number(tr.amount), req.params.id, `Manual top-up approved. Reference ID: ${tr.transaction_id || "n/a"}`]
+  );
+
   return sendSuccess(res, okMessage("Top-up approved."));
 });
 
@@ -379,18 +411,42 @@ router.post("/finance/topups/:id/reject", async (req: AuthenticatedRequest, res:
 
 router.post("/finance/rider-wallets/:riderId/adjust", async (req: AuthenticatedRequest, res: Response) => {
   const amount = Number(req.body?.amount || 0);
-  await safeRows("upsert wallet", "INSERT INTO rider_wallets (rider_id, balance) VALUES ($1, $2) ON CONFLICT (rider_id) DO UPDATE SET balance = rider_wallets.balance + EXCLUDED.balance, updated_at = NOW()", [req.params.riderId, amount]);
+  const inputId = req.params.riderId;
+
+  // rider_wallets.rider_id FKs to rider_profiles.id, but the dashboard may pass
+  // either that or the rider's users.id depending on which list it came from —
+  // resolve either into the real profile id rather than guessing.
+  const profile = await safeRows<{ id: string }>(
+    "resolve rider profile",
+    "SELECT id FROM rider_profiles WHERE id = $1 OR user_id = $1",
+    [inputId]
+  );
+  if (profile.length === 0) {
+    return sendError(res, "RIDER_NOT_FOUND", "No rider profile matches this id.", 404);
+  }
+  const riderProfileId = profile[0].id;
+
+  // The original INSERT also never supplied the required `id` column (no
+  // default), so it always failed silently (swallowed by safeRows) and
+  // reported "Wallet adjusted." without ever actually adjusting anything.
+  await safeRows(
+    "upsert wallet",
+    "INSERT INTO rider_wallets (id, rider_id, balance) VALUES ($1, $2, $3) ON CONFLICT (rider_id) DO UPDATE SET balance = rider_wallets.balance + EXCLUDED.balance, updated_at = NOW()",
+    ["wal_" + crypto.randomUUID().slice(0, 8), riderProfileId, amount]
+  );
   return sendSuccess(res, okMessage("Wallet adjusted."));
 });
 
 router.get("/finance/wallet-ledger", async (req: AuthenticatedRequest, res: Response) => {
+  // wl.rider_id is rider_profiles.id — join on rp.id, not rp.user_id (that was
+  // backwards and never matched a real row).
   const items = await safeRows("wallet ledger", `
     SELECT
       wl.*,
       u.full_name AS rider_name,
       u.phone AS rider_phone
     FROM rider_wallet_ledger wl
-    LEFT JOIN rider_profiles rp ON rp.user_id = wl.rider_id
+    LEFT JOIN rider_profiles rp ON rp.id = wl.rider_id
     LEFT JOIN users u ON u.id = rp.user_id
     ORDER BY wl.created_at DESC
     LIMIT 100
@@ -426,14 +482,68 @@ router.get("/settings/manual-payment-accounts", async (req: AuthenticatedRequest
 });
 
 router.post("/settings/manual-payment-accounts", async (req: AuthenticatedRequest, res: Response) => {
-  const id = req.body?.id || `pay_${crypto.randomUUID().slice(0, 8)}`;
-  await safeRows("create account", `INSERT INTO manual_payment_accounts (id, bank_name, account_title, account_number, instructions, min_topup, max_topup, is_active) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO UPDATE SET bank_name = EXCLUDED.bank_name, account_title = EXCLUDED.account_title, account_number = EXCLUDED.account_number, instructions = EXCLUDED.instructions, min_topup = EXCLUDED.min_topup, max_topup = EXCLUDED.max_topup, is_active = EXCLUDED.is_active`, [id, req.body?.bank_name || req.body?.bankName || "Manual Account", req.body?.account_title || req.body?.accountTitle || "Shazo Ride", req.body?.account_number || req.body?.accountNumber || "", req.body?.instructions || "", String(req.body?.min_topup || "200"), String(req.body?.max_topup || "50000"), req.body?.is_active !== false]);
+  // Real manual_payment_accounts columns are id/account_type/account_title/
+  // account_number/bank_name/instructions/is_active/display_order — there is
+  // no min_topup/max_topup column, so the previous INSERT (which referenced
+  // them) failed outright on every save and was silently swallowed.
+  const id = req.body?.id || `payacct_${crypto.randomUUID().slice(0, 8)}`;
+  await safeRows(
+    "create account",
+    `INSERT INTO manual_payment_accounts (id, account_type, bank_name, account_title, account_number, instructions, is_active, display_order)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+     ON CONFLICT (id) DO UPDATE SET
+       account_type = EXCLUDED.account_type,
+       bank_name = EXCLUDED.bank_name,
+       account_title = EXCLUDED.account_title,
+       account_number = EXCLUDED.account_number,
+       instructions = EXCLUDED.instructions,
+       is_active = EXCLUDED.is_active,
+       display_order = EXCLUDED.display_order,
+       updated_at = NOW()`,
+    [
+      id,
+      req.body?.account_type || "bank",
+      req.body?.bank_name || req.body?.bankName || "",
+      req.body?.account_title || req.body?.accountTitle || "Shazo Ride",
+      req.body?.account_number || req.body?.accountNumber || "",
+      req.body?.instructions || "",
+      req.body?.is_active !== false,
+      Number(req.body?.display_order ?? 0)
+    ]
+  );
   return sendSuccess(res, okMessage("Payment account saved.", { id }));
 });
 
 router.patch("/settings/manual-payment-accounts/:id", async (req: AuthenticatedRequest, res: Response) => {
-  await safeRows("update account", `UPDATE manual_payment_accounts SET bank_name = COALESCE($1, bank_name), account_title = COALESCE($2, account_title), account_number = COALESCE($3, account_number), instructions = COALESCE($4, instructions), is_active = COALESCE($5, is_active) WHERE id = $6`, [req.body?.bank_name || req.body?.bankName || null, req.body?.account_title || req.body?.accountTitle || null, req.body?.account_number || req.body?.accountNumber || null, req.body?.instructions || null, req.body?.is_active, req.params.id]);
+  await safeRows(
+    "update account",
+    `UPDATE manual_payment_accounts SET
+       account_type = COALESCE($1, account_type),
+       bank_name = COALESCE($2, bank_name),
+       account_title = COALESCE($3, account_title),
+       account_number = COALESCE($4, account_number),
+       instructions = COALESCE($5, instructions),
+       is_active = COALESCE($6, is_active),
+       display_order = COALESCE($7, display_order),
+       updated_at = NOW()
+     WHERE id = $8`,
+    [
+      req.body?.account_type || null,
+      req.body?.bank_name ?? req.body?.bankName ?? null,
+      req.body?.account_title ?? req.body?.accountTitle ?? null,
+      req.body?.account_number ?? req.body?.accountNumber ?? null,
+      req.body?.instructions ?? null,
+      req.body?.is_active,
+      req.body?.display_order !== undefined ? Number(req.body.display_order) : null,
+      req.params.id
+    ]
+  );
   return sendSuccess(res, okMessage("Payment account updated."));
+});
+
+router.delete("/settings/manual-payment-accounts/:id", async (req: AuthenticatedRequest, res: Response) => {
+  await safeRows("delete account", "DELETE FROM manual_payment_accounts WHERE id = $1", [req.params.id]);
+  return sendSuccess(res, okMessage("Payment account removed."));
 });
 
 router.get("/settings/fares", async (req: AuthenticatedRequest, res: Response) => {
@@ -570,26 +680,51 @@ router.get(["/settings/free-ride-campaigns", "/promo-campaigns"], async (req: Au
 });
 
 router.post("/promo-campaigns", async (req: AuthenticatedRequest, res: Response) => {
+  // Real columns are total_quota/total_used/starts_at/ends_at/is_active — this
+  // previously inserted into quota_total/allowed_zones/start_at/end_at/status,
+  // none of which exist, so every campaign creation silently did nothing.
   const id = req.body?.id || `camp_${crypto.randomUUID().slice(0, 8)}`;
-  await safeRows("create campaign", `INSERT INTO free_ride_campaigns (id, name, service_type, quota_total, quota_used, allowed_zones, start_at, end_at, status) VALUES ($1,$2,$3,$4,0,$5,COALESCE($6::timestamptz, NOW()),COALESCE($7::timestamptz, NOW() + INTERVAL '30 days'),$8) ON CONFLICT (id) DO NOTHING`, [id, req.body?.name || "Free Ride Campaign", req.body?.service_type || "bike", Number(req.body?.quota_total || 0), req.body?.allowed_zones || "all", req.body?.start_at || null, req.body?.end_at || null, req.body?.status || "active"]);
+  await safeRows(
+    "create campaign",
+    `INSERT INTO free_ride_campaigns (id, name, service_type, total_quota, total_used, starts_at, ends_at, is_active)
+     VALUES ($1,$2,$3,$4,0,COALESCE($5::timestamptz, NOW()),COALESCE($6::timestamptz, NOW() + INTERVAL '30 days'),$7)
+     ON CONFLICT (id) DO NOTHING`,
+    [
+      id,
+      req.body?.name || "Free Ride Campaign",
+      req.body?.service_type || "bike",
+      Number(req.body?.total_quota ?? req.body?.quota_total ?? 0),
+      req.body?.starts_at || req.body?.start_at || null,
+      req.body?.ends_at || req.body?.end_at || null,
+      req.body?.is_active !== false
+    ]
+  );
   return sendSuccess(res, okMessage("Campaign saved.", { id }));
 });
 
 router.patch("/promo-campaigns/:id", async (req: AuthenticatedRequest, res: Response) => {
-  await safeRows("update campaign", "UPDATE free_ride_campaigns SET status = COALESCE($1, status) WHERE id = $2", [req.body?.status || null, req.params.id]);
+  // free_ride_campaigns has no "status" column — it's a plain is_active boolean.
+  const isActive = req.body?.status === undefined ? undefined : req.body.status === "active";
+  await safeRows(
+    "update campaign",
+    "UPDATE free_ride_campaigns SET is_active = COALESCE($1, is_active), updated_at = NOW() WHERE id = $2",
+    [isActive === undefined ? null : isActive, req.params.id]
+  );
   return sendSuccess(res, okMessage("Campaign updated."));
 });
 
 router.get(["/settings/zones", "/zones"], async (req: AuthenticatedRequest, res: Response) => {
+  // service_zones has no service_type column (zones aren't per-service) and its
+  // surge/pricing column is named base_fare_multiplier, not surge_multiplier.
   const items = await safeRows("zones", `
     SELECT
       id,
       name,
       city,
       city AS region,
-      service_type,
       is_active,
-      surge_multiplier,
+      base_fare_multiplier,
+      base_fare_multiplier AS surge_multiplier,
       polygon,
       center_lat,
       center_lng,
@@ -664,7 +799,20 @@ router.get(["/dispatch/live", "/dispatch"], async (req: AuthenticatedRequest, re
 });
 
 router.get("/support/tickets", async (req: AuthenticatedRequest, res: Response) => {
-  const items = await safeRows("tickets", "SELECT * FROM support_tickets ORDER BY created_at DESC LIMIT 100");
+  // support_tickets has no sender name/type columns of its own (there is no
+  // source_type column in production) — join users for a display name and
+  // derive the sender type from the user's role instead.
+  const items = await safeRows("tickets", `
+    SELECT
+      st.*,
+      u.full_name AS sender_name,
+      u.phone AS sender_phone,
+      u.role AS sender_type
+    FROM support_tickets st
+    LEFT JOIN users u ON u.id = st.user_id
+    ORDER BY st.created_at DESC
+    LIMIT 100
+  `);
   return sendSuccess(res, listResponse(items));
 });
 
@@ -680,23 +828,80 @@ router.post("/support/tickets/:id/reply", async (req: AuthenticatedRequest, res:
 });
 
 router.get("/notifications", async (req: AuthenticatedRequest, res: Response) => {
-  const items = await safeRows("notifications", "SELECT * FROM notifications ORDER BY created_at DESC LIMIT 100");
+  // admin_broadcasts is the one-row-per-broadcast log the dashboard reads (it
+  // has the real target_audience/created_at fields); the per-user fan-out into
+  // `notifications` is what customer/rider apps actually poll for their inbox.
+  const items = await safeRows("notifications", "SELECT * FROM admin_broadcasts ORDER BY created_at DESC LIMIT 100");
   return sendSuccess(res, listResponse(items));
 });
 
 router.post("/notifications", async (req: AuthenticatedRequest, res: Response) => {
-  const id = `ntf_${crypto.randomUUID().slice(0, 8)}`;
-  await safeRows("create notification", "INSERT INTO notifications (id, user_id, title, body, data_payload) VALUES ($1,$2,$3,$4,$5)", [id, req.user!.id, req.body?.title || "Admin Notification", req.body?.body || req.body?.message || "", JSON.stringify(req.body || {})]);
-  return sendSuccess(res, okMessage("Notification saved.", { id }));
+  // Previously this inserted exactly one `notifications` row scoped to the
+  // admin's own user_id — nobody else ever received it, so "broadcast" did
+  // nothing for real customers/riders. Now it fans out a row per matching
+  // user (by role) and logs the broadcast itself for the dashboard's list.
+  const title = req.body?.title || "Admin Notification";
+  const body = req.body?.body || req.body?.message || "";
+  const audience = String(req.body?.targetAudience || req.body?.target_audience || "all");
+
+  const roleMap: Record<string, string[]> = {
+    customers: ["customer"],
+    riders: ["rider"],
+    restaurants: ["restaurant"],
+    all: ["customer", "rider", "restaurant"],
+  };
+  const roles = roleMap[audience] || roleMap.all;
+
+  const broadcastId = `bcast_${crypto.randomUUID().slice(0, 8)}`;
+  await safeRows(
+    "log broadcast",
+    "INSERT INTO admin_broadcasts (id, title, body, target_audience, sent_by) VALUES ($1,$2,$3,$4,$5)",
+    [broadcastId, title, body, audience, req.user!.id]
+  );
+
+  const recipients = await safeRows<{ id: string }>(
+    "broadcast recipients",
+    `SELECT id FROM users WHERE role = ANY($1::text[])`,
+    [roles as any]
+  );
+  for (const recipient of recipients) {
+    const id = `ntf_${crypto.randomUUID().slice(0, 8)}`;
+    await safeRows(
+      "create notification",
+      "INSERT INTO notifications (id, user_id, title, body, metadata) VALUES ($1,$2,$3,$4,$5)",
+      [id, recipient.id, title, body, JSON.stringify({ broadcast_id: broadcastId })]
+    );
+  }
+
+  return sendSuccess(res, okMessage("Notification broadcast to " + recipients.length + " user(s).", { id: broadcastId }));
 });
 
 router.get(["/safety/reports", "/safety-incidents"], async (req: AuthenticatedRequest, res: Response) => {
-  const items = await safeRows("safety", "SELECT * FROM safety_reports ORDER BY created_at DESC LIMIT 100");
+  // Real safety_reports columns are reporter_id/ride_id/report_type/severity/
+  // status/resolved_by/resolved_at — there is no reported_by_id, booking_id,
+  // investigation_status, is_emergency, or admin_notes column in production.
+  // Join users so the dashboard has a real reporter name/role to display.
+  const items = await safeRows("safety", `
+    SELECT
+      sr.*,
+      u.full_name AS reporter_name,
+      u.role AS reporter_role
+    FROM safety_reports sr
+    LEFT JOIN users u ON u.id = sr.reporter_id
+    ORDER BY sr.created_at DESC
+    LIMIT 100
+  `);
   return sendSuccess(res, listResponse(items));
 });
 
 router.post("/safety/:id/resolve", async (req: AuthenticatedRequest, res: Response) => {
-  await safeRows("resolve safety", "UPDATE safety_reports SET investigation_status = 'resolved', admin_notes = COALESCE($1, admin_notes) WHERE id = $2", [req.body?.notes || null, req.params.id]);
+  // Previously wrote to investigation_status/admin_notes, neither of which
+  // exist on the real table, so this silently did nothing in production.
+  await safeRows(
+    "resolve safety",
+    "UPDATE safety_reports SET status = 'resolved', resolved_by = $1, resolved_at = NOW(), updated_at = NOW() WHERE id = $2",
+    [req.user!.id, req.params.id]
+  );
   return sendSuccess(res, okMessage("Safety report resolved."));
 });
 
@@ -706,7 +911,36 @@ router.get(["/users", "/staff-users"], async (req: AuthenticatedRequest, res: Re
 });
 
 router.post("/staff-users", async (req: AuthenticatedRequest, res: Response) => {
-  return sendSuccess(res, okMessage("Staff creation requires password setup. Use backend seed/user management for now."));
+  // Was a no-op stub (returned a success message but never inserted a row),
+  // so the dashboard's "Add Staff Account" form silently created nothing.
+  // Now it really provisions the account with a generated temp password —
+  // there's no email/SMS delivery wired up, so it's returned once in the
+  // response for the admin to hand off out-of-band.
+  const { name, email, role } = req.body || {};
+  if (!name || !email || !role) {
+    return sendError(res, "VALIDATION_FAILED", "name, email, and role are required.");
+  }
+  const allowedRoles = ["admin", "operations_manager", "finance_admin", "support_agent"];
+  if (!allowedRoles.includes(role)) {
+    return sendError(res, "VALIDATION_FAILED", "role must be one of: " + allowedRoles.join(", "));
+  }
+
+  const existing = await safeRows("staff email check", "SELECT id FROM users WHERE email = $1", [email]);
+  if (existing.length > 0) {
+    return sendError(res, "EMAIL_TAKEN", "A user with this email already exists.", 409);
+  }
+
+  const id = `usr_${crypto.randomUUID().slice(0, 8)}`;
+  const tempPassword = crypto.randomBytes(6).toString("base64url");
+  const passwordHash = await bcrypt.hash(tempPassword, 10);
+
+  await safeRows(
+    "create staff user",
+    "INSERT INTO users (id, full_name, email, role, is_verified, password_hash) VALUES ($1,$2,$3,$4,true,$5)",
+    [id, name, email, role, passwordHash]
+  );
+
+  return sendSuccess(res, okMessage("Staff account created.", { id, tempPassword }));
 });
 
 router.get("/health", async (req: AuthenticatedRequest, res: Response) => {

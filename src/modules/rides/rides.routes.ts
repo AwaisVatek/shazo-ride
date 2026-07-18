@@ -327,9 +327,18 @@ router.post("/offer-fare", requireAuth, async (req: AuthenticatedRequest, res: R
  * GET /:id/messages
  * Retrieves the chat history for a specific ride
  */
-router.get("/:id/messages", requireAuth, async (req, res) => {
+router.get("/:id/messages", requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
+
+    const rides = await db.query("SELECT customer_id, rider_id FROM ride_bookings WHERE id = $1", [id]);
+    if (rides.length === 0) {
+      return sendError(res, "RIDE_NOT_FOUND", "Ride not found", 404);
+    }
+    if (rides[0].customer_id !== req.user!.id && rides[0].rider_id !== req.user!.id) {
+      return sendError(res, "FORBIDDEN", "You are not authorized to view messages for this ride.", 403);
+    }
+
     const messages = await db.query(
       "SELECT * FROM ride_messages WHERE ride_id = $1 ORDER BY created_at ASC",
       [id]
@@ -344,11 +353,26 @@ router.get("/:id/messages", requireAuth, async (req, res) => {
  * PATCH /api/rides/:id/status
  * Drives transitions during ride status changes
  */
+// Legal ride status transitions. Keys are the current status, values are the
+// statuses that may legally follow. Anything not listed is rejected as invalid.
+const RIDE_STATUS_TRANSITIONS: Record<string, string[]> = {
+  requested: ["accepted", "cancelled"],
+  accepted: ["arrived", "cancelled"],
+  arrived: ["in_transit", "cancelled"],
+  in_transit: ["completed"],
+  completed: [],
+  cancelled: [],
+};
+
 router.patch("/:id/status", requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   const rideId = req.params.id;
   const { status, note } = req.body;
 
   if (!status) return sendError(res, "VALIDATION_FAILED", "Status parameters are missing.");
+
+  if (!Object.prototype.hasOwnProperty.call(RIDE_STATUS_TRANSITIONS, status)) {
+    return sendError(res, "VALIDATION_FAILED", "Unrecognized ride status value.", 400);
+  }
 
   try {
     const rides = await db.query("SELECT * FROM ride_bookings WHERE id = $1", [rideId]);
@@ -361,19 +385,37 @@ router.patch("/:id/status", requireAuth, async (req: AuthenticatedRequest, res: 
     // Assert that status transitions flow in sequence
     // requested -> accepted -> arrived -> in_transit -> completed
     // Cancellables only before in_transit
+    const allowedNextStatuses = RIDE_STATUS_TRANSITIONS[currentRide.status] || [];
+    if (!allowedNextStatuses.includes(status)) {
+      return sendError(res, "INVALID_TRANSITION", `Cannot transition ride from '${currentRide.status}' to '${status}'.`, 400);
+    }
+
+    const isCustomer = currentRide.customer_id === req.user!.id;
+    const isAssignedRider = currentRide.rider_id === req.user!.id;
 
     let updateQuery = "";
     let params: any[] = [];
 
     if (status === "accepted") {
-      // Driver claims this ride
+      // Driver claims this ride. No party is assigned yet at this transition point,
+      // so any verified rider may claim it (ownership is established by this action).
       if (req.user!.role !== "rider") {
         return sendError(res, "FORBIDDEN", "Only verified pilots can accept ride requests.", 403);
       }
       updateQuery = "UPDATE ride_bookings SET rider_id = $1, status = $2, updated_at = NOW() WHERE id = $3";
       params = [req.user!.id, "accepted", rideId];
+    } else if (status === "cancelled") {
+      // Either the customer or the assigned rider may cancel.
+      if (!isCustomer && !isAssignedRider) {
+        return sendError(res, "FORBIDDEN", "You are not authorized to cancel this ride.", 403);
+      }
+      updateQuery = "UPDATE ride_bookings SET status = $1, updated_at = NOW() WHERE id = $2";
+      params = [status, rideId];
     } else {
-      // General transition updates
+      // arrived / in_transit / completed: only the assigned pilot drives trip progress.
+      if (!isAssignedRider) {
+        return sendError(res, "FORBIDDEN", "Only the assigned pilot can update this ride's progress.", 403);
+      }
       updateQuery = "UPDATE ride_bookings SET status = $1, updated_at = NOW() WHERE id = $2";
       params = [status, rideId];
     }
@@ -430,6 +472,7 @@ router.patch("/:id/status", requireAuth, async (req: AuthenticatedRequest, res: 
     }
 
     const updated = await db.query("SELECT * FROM ride_bookings WHERE id = $1", [rideId]);
+    io.to(rideId).emit("ride_update", { rideId, status });
     return sendSuccess(res, { ride: updated[0] });
 
   } catch (err: any) {
@@ -446,10 +489,13 @@ router.post("/:id/cancel", requireAuth, async (req: AuthenticatedRequest, res: R
   const { reason } = req.body;
 
   try {
-    const rides = await db.query("SELECT status FROM ride_bookings WHERE id = $1", [rideId]);
+    const rides = await db.query("SELECT customer_id, rider_id, status FROM ride_bookings WHERE id = $1", [rideId]);
     if (rides.length === 0) return sendError(res, "RIDE_NOT_FOUND", "Encountered invalid ride target.", 404);
 
-    const { status } = rides[0];
+    const { customer_id, rider_id, status } = rides[0];
+    if (customer_id !== req.user!.id && rider_id !== req.user!.id) {
+      return sendError(res, "FORBIDDEN", "You are not authorized to cancel this ride.", 403);
+    }
     if (["in_transit", "completed", "cancelled"].includes(status)) {
       return sendError(res, "INVALID_STATE", `Cannot cancel a ride that is currently either ${status}.`, 400);
     }
@@ -462,6 +508,7 @@ router.post("/:id/cancel", requireAuth, async (req: AuthenticatedRequest, res: R
       ["log_" + crypto.randomUUID().slice(0, 8), rideId, reason || "Ride cancelled by user request."]
     );
 
+    io.to(rideId).emit("ride_update", { rideId, status: "cancelled" });
     return sendSuccess(res, { message: "Ride booking cancelled successfully." });
 
   } catch (err: any) {
@@ -482,10 +529,15 @@ router.post("/:id/rate", requireAuth, async (req: Request, res: Response) => {
   }
 
   try {
-    const matched = await db.query("SELECT rider_id, status FROM ride_bookings WHERE id = $1", [rideId]);
+    const matched = await db.query("SELECT customer_id, rider_id, status FROM ride_bookings WHERE id = $1", [rideId]);
     if (matched.length === 0) return sendError(res, "RIDE_NOT_FOUND", "Invalid ride mapping.", 404);
 
-    const { rider_id, status } = matched[0];
+    const { customer_id, rider_id, status } = matched[0];
+    const authUser = (req as AuthenticatedRequest).user!;
+    if (customer_id !== authUser.id) {
+      return sendError(res, "FORBIDDEN", "Only the ride's customer can submit a rating.", 403);
+    }
+
     if (status !== "completed") {
       return sendError(res, "INVALID_STATE", "Ratings can only be posted after journey completion.", 400);
     }
@@ -494,14 +546,24 @@ router.post("/:id/rate", requireAuth, async (req: Request, res: Response) => {
       return sendError(res, "NO_DRIVER", "No rider is assigned to this reservation history.", 400);
     }
 
-    // Save ratings score
-    const ratingId = "rat_" + crypto.randomUUID().slice(0, 8);
-    // Explicit insert matching customer_ratings or audit table
+    // Persist the score on the ride itself, and roll it into the driver's aggregate rating
+    await db.query("UPDATE ride_bookings SET rider_rating = $1, updated_at = NOW() WHERE id = $2", [score, rideId]);
     await db.query(
-      `INSERT INTO audit_logs (id, user_id, role, action, target_table, target_row_id, notes)
-       VALUES ($1, $2, 'customer', 'rate_ride_journey', 'ride_bookings', $3, $4)`,
-      [ratingId, (req as AuthenticatedRequest).user!.id, rideId, `Score ${score}/5 posted for driver ${rider_id}. Details: ${review || "None"}`]
+      `UPDATE rider_profiles SET rating = (
+         SELECT AVG(rider_rating) FROM ride_bookings WHERE rider_id = $1 AND rider_rating IS NOT NULL
+       ), updated_at = NOW() WHERE user_id = $1`,
+      [rider_id]
     );
+
+    // Keep the free-text review as an audit log — there's no dedicated review column on ride_bookings
+    if (review) {
+      const ratingId = "rat_" + crypto.randomUUID().slice(0, 8);
+      await db.query(
+        `INSERT INTO audit_logs (id, user_id, role, action, target_table, target_id, notes)
+         VALUES ($1, $2, 'customer', 'rate_ride_journey', 'ride_bookings', $3, $4)`,
+        [ratingId, authUser.id, rideId, `Score ${score}/5 posted for driver ${rider_id}. Review: ${review}`]
+      );
+    }
 
     return sendSuccess(res, { message: "Thank you! Your feedback has been logged cleanly." });
 
@@ -523,6 +585,9 @@ router.post("/:id/emergency", requireAuth, async (req: AuthenticatedRequest, res
     if (rides.length === 0) return sendError(res, "RIDE_NOT_FOUND", "Invalid ride target reference.", 404);
 
     const currentRide = rides[0];
+    if (currentRide.customer_id !== req.user!.id && currentRide.rider_id !== req.user!.id) {
+      return sendError(res, "FORBIDDEN", "You are not authorized to raise an emergency for this ride.", 403);
+    }
     const reportId = "sos_" + crypto.randomUUID().slice(0, 8);
 
     // Save safety report row
@@ -557,8 +622,14 @@ router.post("/:id/emergency", requireAuth, async (req: AuthenticatedRequest, res
 router.get("/:id/status", requireAuth, async (req: Request, res: Response) => {
   const rideId = req.params.id;
   try {
-    const rides = await db.query("SELECT id, status, rider_id FROM ride_bookings WHERE id = $1", [rideId]);
+    const rides = await db.query("SELECT id, status, customer_id, rider_id FROM ride_bookings WHERE id = $1", [rideId]);
     if (rides.length === 0) return sendError(res, "NOT_FOUND", "Ride not found");
+
+    const authReq = req as AuthenticatedRequest;
+    if (rides[0].customer_id !== authReq.user!.id && rides[0].rider_id !== authReq.user!.id) {
+      return sendError(res, "FORBIDDEN", "You are not authorized to view this ride.", 403);
+    }
+
     return sendSuccess(res, { status: rides[0].status, rider_id: rides[0].rider_id });
   } catch (err: any) {
     return sendError(res, "FETCH_FAILED", err.message, 500);
@@ -569,9 +640,14 @@ router.get("/:id", requireAuth, async (req: Request, res: Response) => {
   try {
     const rides = await db.query("SELECT * FROM ride_bookings WHERE id = $1", [req.params.id]);
     if (rides.length === 0) return sendError(res, "NOT_FOUND", "Ride not found");
-    
-    // Also fetch driver details if assigned
+
     const ride = rides[0];
+    const authReq = req as AuthenticatedRequest;
+    if (ride.customer_id !== authReq.user!.id && ride.rider_id !== authReq.user!.id) {
+      return sendError(res, "FORBIDDEN", "You are not authorized to view this ride.", 403);
+    }
+
+    // Also fetch driver details if assigned
     if (ride.rider_id) {
       const drivers = await db.query("SELECT full_name as name, phone, id FROM users WHERE id = $1", [ride.rider_id]);
       if (drivers.length > 0) {

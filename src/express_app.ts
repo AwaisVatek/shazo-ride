@@ -119,12 +119,11 @@ app.get("/api/health/database", async (req: Request, res: Response) => {
 });
 
 app.get("/api/health/maps", async (req: Request, res: Response) => {
-  const isGeoConfigured = config.GEOCODING_API_KEY && config.GEOCODING_API_KEY !== "YOUR_BACKEND_GEOCODING_KEY" && config.GEOCODING_API_KEY !== "demo_maps_geocoding_key_backend";
+  const isMapboxConfigured = !!config.MAPBOX_API_KEY && config.MAPBOX_API_KEY !== "demo_mapbox_secret_key";
   return sendSuccess(res, {
     maps_provider: config.MAPS_PROVIDER,
-    geocoding_initialized: !!isGeoConfigured,
-    maps_key_configured: config.MAPS_API_KEY !== "YOUR_FRONTEND_MAPS_KEY",
-    notice: "Automatic Karachi geometrical fallbacks are active if API keys represent placeholders."
+    mapbox_key_configured: isMapboxConfigured,
+    notice: isMapboxConfigured ? "Mapbox is fully configured." : "MAPBOX_API_KEY is a placeholder — geocoding/directions calls will fail."
   });
 });
 

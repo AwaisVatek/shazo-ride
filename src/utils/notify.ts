@@ -81,9 +81,7 @@ class NotificationService {
           delay: 1200,
           presence: "composing"
         },
-        textMessage: {
-          text: message
-        }
+        text: message
       };
 
       const response = await fetch(url, {

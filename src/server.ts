@@ -36,6 +36,12 @@ io.on("connection", (socket) => {
     console.log(`Customer joined ride tracking: ${rideId}`);
   });
 
+  // A customer joins their ambulance dispatch's room to receive status updates
+  socket.on("join_ambulance", (requestId) => {
+    socket.join(`ambulance_${requestId}`);
+    console.log(`Customer joined ambulance tracking: ${requestId}`);
+  });
+
   // Chat message system for an active ride
   socket.on("send_message", async (data: { rideId: string, senderId: string, senderRole: string, content: string }) => {
     try {

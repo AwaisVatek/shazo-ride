@@ -1,9 +1,10 @@
 import { Router, Request, Response } from "express";
 import crypto from "crypto";
-import { requireAuth, AuthenticatedRequest } from "../../middleware/auth";
+import { requireAuth, requireOperationsManager, AuthenticatedRequest } from "../../middleware/auth";
 import { sendSuccess, sendError } from "../../utils/response";
 import { config } from "../../config/index";
 import { db } from "../../db/index";
+import { io } from "../../server";
 
 const router = Router();
 
@@ -114,28 +115,30 @@ router.post("/create", requireAuth, async (req: AuthenticatedRequest, res: Respo
  * PATCH /api/ambulance/:id/status
  * Updates dispatch state and assigns vehicle details
  */
-router.patch("/:id/status", requireAuth, async (req: Request, res: Response) => {
+router.patch("/:id/status", requireAuth, requireOperationsManager, async (req: Request, res: Response) => {
   const bookingId = req.params.id;
-  const { status, assigned_driver_name, assigned_vehicle_plate } = req.body;
+  const { status, driver_name, assigned_vehicle_number } = req.body;
 
   if (!status) return sendError(res, "VALIDATION_FAILED", "Status parameters are missing.");
 
   try {
-    await db.query(
-      `UPDATE ambulance_bookings 
-       SET status = $1, 
-           assigned_driver_name = COALESCE($2, assigned_driver_name),
-           assigned_vehicle_plate = COALESCE($3, assigned_vehicle_plate),
+    const updated = await db.query(
+      `UPDATE ambulance_bookings
+       SET status = $1,
+           driver_name = COALESCE($2, driver_name),
+           assigned_vehicle_number = COALESCE($3, assigned_vehicle_number),
+           dispatched_at = CASE WHEN $1 = 'dispatched' THEN NOW() ELSE dispatched_at END,
            updated_at = NOW()
-       WHERE id = $4`,
-      [status, assigned_driver_name || null, assigned_vehicle_plate || null, bookingId]
+       WHERE id = $4
+       RETURNING *`,
+      [status, driver_name || null, assigned_vehicle_number || null, bookingId]
     );
 
-    const updated = await db.query("SELECT * FROM ambulance_bookings WHERE id = $1", [bookingId]);
     if (updated.length === 0) {
       return sendError(res, "NOT_FOUND", "No ambulance dispatch record matches this ID.", 404);
     }
 
+    io.to(`ambulance_${bookingId}`).emit("ambulance_update", { requestId: bookingId, status });
     return sendSuccess(res, { booking: updated[0] });
 
   } catch (err: any) {

@@ -73,10 +73,9 @@ const configSchema = z.object({
   FREE_COMMISSION_START_DATE: z.string().default("2026-06-01"),
   FREE_COMMISSION_END_DATE: z.string().default("2026-12-31"),
 
-  // Google Maps Providers Key definitions
-  MAPS_PROVIDER: z.string().default("google"),
-  MAPS_API_KEY: z.string().default("demo_maps_api_key_public"),
-  GEOCODING_API_KEY: z.string().default("demo_maps_geocoding_key_backend"),
+  // Maps provider — Mapbox is the platform's only maps/geocoding provider (no Google Maps).
+  MAPS_PROVIDER: z.string().default("mapbox"),
+  MAPBOX_API_KEY: z.string().default("demo_mapbox_secret_key"),
 
   // Demo Sandbox rules
   ENABLE_DEMO_CREDENTIALS: z.preprocess((val) => val !== "false", z.boolean().default(true)),

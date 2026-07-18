@@ -53,9 +53,7 @@ export class EvolutionWhatsAppService {
         presence: "composing",
         linkPreview: false
       },
-      textMessage: {
-        text: message
-      }
+      text: message
     };
 
     try {

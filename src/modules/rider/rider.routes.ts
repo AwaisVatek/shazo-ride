@@ -4,6 +4,8 @@ import { requireAuth, requireRider, requireWalletEligibleRider, requireVerifiedR
 import { sendSuccess, sendError } from "../../utils/response";
 import { db } from "../../db/index";
 import { domainNotifier } from "../../services/notification.service";
+import { computeEtaMinutes } from "../../services/eta.service";
+import { io } from "../../server";
 
 const router = Router();
 
@@ -268,7 +270,32 @@ router.patch("/location", async (req: Request, res: Response) => {
   if (!latitude || !longitude) return sendError(res, "VALIDATION_FAILED", "latitude and longitude required");
 
   // In production, update PostGIS or Redis here. For MVP, we'll log it.
-  await db.query("UPDATE rider_profiles SET last_lat = $1, last_lng = $2, updated_at = NOW() WHERE user_id = $3", [latitude, longitude, authReq.user!.id]);
+  await db.query("UPDATE rider_profiles SET current_lat = $1, current_lng = $2, last_location_at = NOW(), updated_at = NOW() WHERE user_id = $3", [latitude, longitude, authReq.user!.id]);
+
+  // Push this position live to any ride this driver currently has active,
+  // so the customer's map can animate the driver's marker in real time.
+  const activeRides = await db.query(
+    "SELECT id, status, pickup_lat, pickup_lng, dropoff_lat, dropoff_lng FROM ride_bookings WHERE rider_id = $1 AND status IN ('accepted', 'arrived', 'in_transit')",
+    [authReq.user!.id]
+  );
+
+  for (const ride of activeRides) {
+    const target = ride.status === "in_transit"
+      ? { lat: ride.dropoff_lat, lng: ride.dropoff_lng }
+      : { lat: ride.pickup_lat, lng: ride.pickup_lng };
+
+    const etaMinutes = target.lat != null && target.lng != null
+      ? await computeEtaMinutes(latitude, longitude, target.lat, target.lng)
+      : null;
+
+    io.to(ride.id).emit("driver_location", {
+      rideId: ride.id,
+      latitude,
+      longitude,
+      etaMinutes
+    });
+  }
+
   return sendSuccess(res, { message: "Location updated." });
 });
 
@@ -296,7 +323,7 @@ router.get("/jobs", async (req: Request, res: Response) => {
        FROM ride_bookings rb
        LEFT JOIN users u ON rb.customer_id = u.id
        WHERE (rb.status = 'requested' AND rb.rider_id IS NULL) 
-          OR (rb.rider_id = $1 AND rb.status IN ('assigned', 'arrived', 'in_transit'))
+          OR (rb.rider_id = $1 AND rb.status IN ('accepted', 'arrived', 'in_transit'))
        ORDER BY rb.created_at DESC`,
       [authReq.user!.id]
     );
@@ -322,10 +349,12 @@ router.post("/jobs/:id/accept", requireWalletEligibleRider, async (req: Request,
     }
 
     await db.query(
-      "UPDATE ride_bookings SET status = 'assigned', rider_id = $1, updated_at = NOW() WHERE id = $2",
+      "UPDATE ride_bookings SET status = 'accepted', rider_id = $1, updated_at = NOW() WHERE id = $2",
       [authReq.user!.id, rideId]
     );
     await db.query("COMMIT");
+
+    io.to(rideId).emit("ride_update", { rideId, status: "accepted" });
 
     const customer = await db.query("SELECT phone FROM users WHERE id = $1", [ride[0].customer_id]);
     const rider = await db.query("SELECT u.full_name, rv.registration_number AS vehicle_number, rv.make_model AS vehicle_model FROM users u LEFT JOIN rider_vehicles rv ON u.id = rv.rider_id WHERE u.id = $1", [authReq.user!.id]);
@@ -360,9 +389,13 @@ router.post("/jobs/:id/arrived", async (req: Request, res: Response) => {
   try {
     const ride = await db.query("SELECT * FROM ride_bookings WHERE id = $1 AND rider_id = $2", [req.params.id, authReq.user!.id]);
     if (ride.length === 0) return sendError(res, "INVALID_JOB", "Job not found or not yours.");
-    
+    if (ride[0].status !== "accepted") {
+      return sendError(res, "INVALID_TRANSITION", `Cannot mark as arrived from status '${ride[0].status}'.`);
+    }
+
     await db.query("UPDATE ride_bookings SET status = 'arrived', updated_at = NOW() WHERE id = $1", [req.params.id]);
-    
+    io.to(req.params.id).emit("ride_update", { rideId: req.params.id, status: "arrived" });
+
     const customer = await db.query("SELECT phone FROM users WHERE id = $1", [ride[0].customer_id]);
     if (customer.length > 0) await domainNotifier.dispatch(customer[0].phone, "rider_arrived", {});
 
@@ -380,9 +413,13 @@ router.post("/jobs/:id/start", async (req: Request, res: Response) => {
   try {
     const ride = await db.query("SELECT * FROM ride_bookings WHERE id = $1 AND rider_id = $2", [req.params.id, authReq.user!.id]);
     if (ride.length === 0) return sendError(res, "INVALID_JOB", "Job not found.");
-    
+    if (ride[0].status !== "arrived") {
+      return sendError(res, "INVALID_TRANSITION", `Cannot start ride from status '${ride[0].status}'.`);
+    }
+
     await db.query("UPDATE ride_bookings SET status = 'in_transit', updated_at = NOW() WHERE id = $1", [req.params.id]);
-    
+    io.to(req.params.id).emit("ride_update", { rideId: req.params.id, status: "in_transit" });
+
     const customer = await db.query("SELECT phone FROM users WHERE id = $1", [ride[0].customer_id]);
     if (customer.length > 0) await domainNotifier.dispatch(customer[0].phone, "ride_started", {});
 
@@ -400,9 +437,13 @@ router.post("/jobs/:id/complete", async (req: Request, res: Response) => {
   try {
     const ride = await db.query("SELECT * FROM ride_bookings WHERE id = $1 AND rider_id = $2", [req.params.id, authReq.user!.id]);
     if (ride.length === 0) return sendError(res, "INVALID_JOB", "Job not found.");
-    
+    if (ride[0].status !== "in_transit") {
+      return sendError(res, "INVALID_TRANSITION", `Cannot complete ride from status '${ride[0].status}'.`);
+    }
+
     await db.query("UPDATE ride_bookings SET status = 'completed', updated_at = NOW() WHERE id = $1", [req.params.id]);
-    
+    io.to(req.params.id).emit("ride_update", { rideId: req.params.id, status: "completed" });
+
     // Ledger deduction is handled by the financial processor or legacy routes,
     // but we notify the customer immediately
     const customer = await db.query("SELECT phone FROM users WHERE id = $1", [ride[0].customer_id]);

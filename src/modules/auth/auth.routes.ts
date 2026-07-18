@@ -176,8 +176,9 @@ router.post("/otp/verify", async (req: Request, res: Response) => {
       const freshlyCreated = await db.query("SELECT * FROM users WHERE id = $1", [newId]);
       activeUser = freshlyCreated[0];
 
-      // Add to customer_profiles table automatically
-      await db.query("INSERT INTO customer_profiles (user_id) VALUES ($1)", [newId]);
+      // Add to customer_profiles table automatically. id is NOT NULL with no
+      // default, so omitting it crashes this insert with a not-null violation.
+      await db.query("INSERT INTO customer_profiles (id, user_id) VALUES ($1, $2)", ["cust_" + crypto.randomUUID().slice(0, 8), newId]);
     } else {
       activeUser = userRows[0];
     }
@@ -248,7 +249,7 @@ router.post("/email/signup", async (req: Request, res: Response) => {
       ["auth_" + crypto.randomUUID().slice(0, 8), userId, email.toLowerCase().trim()]
     );
 
-    await db.query("INSERT INTO customer_profiles (user_id) VALUES ($1)", [userId]);
+    await db.query("INSERT INTO customer_profiles (id, user_id) VALUES ($1, $2)", ["cust_" + crypto.randomUUID().slice(0, 8), userId]);
 
     return sendSuccess(res, {
       message: "Registration completed successfully. Welcome to Shazo!",
@@ -536,12 +537,15 @@ router.post("/verify-otp", async (req: Request, res: Response) => {
 
       if (role === "customer") {
         await db.query(
-          `INSERT INTO customer_profiles (user_id) VALUES ($1)`, 
-          [newId]
+          `INSERT INTO customer_profiles (id, user_id) VALUES ($1, $2)`,
+          ["cust_" + crypto.randomUUID().slice(0, 8), newId]
         );
       } else if (role === "rider") {
-        await db.query("INSERT INTO rider_profiles (user_id) VALUES ($1)", [newId]);
-        await db.query("INSERT INTO rider_wallets (rider_id, balance) VALUES ($1, 0)", [newId]);
+        // rider_wallets.rider_id is a FK to rider_profiles.id, NOT users.id —
+        // must reuse the generated profile id here, not the user id.
+        const riderProfileId = "ridr_" + crypto.randomUUID().slice(0, 8);
+        await db.query("INSERT INTO rider_profiles (id, user_id) VALUES ($1, $2)", [riderProfileId, newId]);
+        await db.query("INSERT INTO rider_wallets (id, rider_id, balance) VALUES ($1, $2, 0)", ["wlt_" + crypto.randomUUID().slice(0, 8), riderProfileId]);
       }
 
       const freshlyCreated = await db.query("SELECT * FROM users WHERE id = $1", [newId]);
@@ -660,20 +664,29 @@ router.post("/signup-password", async (req: Request, res: Response) => {
 
       if (role === "customer") {
         console.log("[SIGNUP] Inserting customer_profiles");
+        // customer_profiles.id is NOT NULL with no default — omitting it here
+        // was crashing every customer signup with a not-null violation.
         await client.query(
-          `INSERT INTO customer_profiles (user_id, default_city) VALUES ($1, $2)`, 
-          [userId, default_city || null]
+          `INSERT INTO customer_profiles (id, user_id, default_city) VALUES ($1, $2, $3)`,
+          ["cust_" + crypto.randomUUID().slice(0, 8), userId, default_city || null]
         );
       } else if (role === "rider") {
         console.log("[SIGNUP] Inserting rider_profiles");
+        // rider_profiles.id and rider_wallets.id are also NOT NULL with no
+        // default — same bug, same fix. vehicle_type is NOT NULL too (default
+        // 'bike') — omit it entirely so the column default applies; the rider
+        // sets their real vehicle during onboarding/profile completion.
+        // rider_wallets.rider_id is a FK to rider_profiles.id, NOT users.id —
+        // must reuse the generated profile id, not userId, below.
+        const riderProfileId = "ridr_" + crypto.randomUUID().slice(0, 8);
         await client.query(
-          `INSERT INTO rider_profiles (user_id, vehicle_type) VALUES ($1, $2)`,
-          [userId, null]
+          `INSERT INTO rider_profiles (id, user_id) VALUES ($1, $2)`,
+          [riderProfileId, userId]
         );
         console.log("[SIGNUP] Inserting rider_wallets");
         await client.query(
-          `INSERT INTO rider_wallets (rider_id, balance) VALUES ($1, 0)`,
-          [userId]
+          `INSERT INTO rider_wallets (id, rider_id, balance) VALUES ($1, $2, 0)`,
+          ["wlt_" + crypto.randomUUID().slice(0, 8), riderProfileId]
         );
       }
 
