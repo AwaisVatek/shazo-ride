@@ -1,4 +1,4 @@
-import { db } from './db/index';
+import { db } from '../../db/index';
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 const { io: ioClient } = require('C:/Users/muhammad.awais_codup/Documents/Awais/shazo-ride/shazo-ride/shazo-rider-app/node_modules/socket.io-client');

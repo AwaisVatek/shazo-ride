@@ -1,4 +1,5 @@
 import { Router, Request, Response } from "express";
+import crypto from "node:crypto";
 import { requireAuth, requireRider, requireWalletEligibleRider, requireVerifiedRider, AuthenticatedRequest } from "../../middleware/auth";
 import { sendSuccess, sendError } from "../../utils/response";
 import { db } from "../../db/index";
@@ -339,14 +340,37 @@ router.get("/status", async (req: Request, res: Response) => {
  * GET /api/rider/jobs
  * Returns jobs matching this rider's service profile in 'requested' state, or currently assigned to them.
  */
-router.get("/jobs", async (req: Request, res: Response) => {
+router.get("/jobs", requireVerifiedRider, requireWalletEligibleRider, async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
   try {
     const jobs = await db.query(
-      `SELECT rb.*, u.full_name as customer_name, u.phone as customer_phone
+      `SELECT rb.id, rb.status, rb.pickup_address, rb.pickup_lat, rb.pickup_lng,
+              rb.dropoff_address, rb.dropoff_lat, rb.dropoff_lng, rb.distance_km,
+              rb.duration_minutes, rb.service_type, rb.vehicle_category, rb.fare,
+              rb.total_fare, rb.system_estimated_fare, rb.customer_offer_fare,
+              rb.minimum_fare, rb.maximum_fare, rb.accepted_fare, rb.payment_method,
+              rb.negotiation_status, rb.created_at, rb.accepted_at, rb.rider_id,
+              u.full_name as customer_name,
+              CASE WHEN rb.rider_id = $1 THEN u.phone ELSE NULL END as customer_phone,
+              CASE WHEN rp.current_lat IS NOT NULL AND rp.current_lng IS NOT NULL THEN
+                6371 * acos(LEAST(1, GREATEST(-1,
+                  cos(radians(rp.current_lat)) * cos(radians(rb.pickup_lat)) *
+                  cos(radians(rb.pickup_lng) - radians(rp.current_lng)) +
+                  sin(radians(rp.current_lat)) * sin(radians(rb.pickup_lat)))))
+              ELSE NULL END AS pickup_distance_km
        FROM ride_bookings rb
        LEFT JOIN users u ON rb.customer_id = u.id
-       WHERE (rb.status = 'requested' AND rb.rider_id IS NULL) 
+       JOIN rider_profiles rp ON rp.user_id = $1
+       WHERE (rb.status = 'requested' AND rb.rider_id IS NULL
+              AND rp.is_online = true
+              AND rp.current_lat IS NOT NULL AND rp.current_lng IS NOT NULL
+              AND rp.last_location_at > NOW() - INTERVAL '10 minutes'
+              AND ((rp.vehicle_type = 'car' AND rb.service_type LIKE 'car_%')
+                   OR rb.service_type = rp.vehicle_type)
+              AND 6371 * acos(LEAST(1, GREATEST(-1,
+                    cos(radians(rp.current_lat)) * cos(radians(rb.pickup_lat)) *
+                    cos(radians(rb.pickup_lng) - radians(rp.current_lng)) +
+                    sin(radians(rp.current_lat)) * sin(radians(rb.pickup_lat))))) <= 15)
           OR (rb.rider_id = $1 AND rb.status IN ('accepted', 'arrived', 'in_transit'))
        ORDER BY rb.created_at DESC`,
       [authReq.user!.id]
@@ -360,28 +384,53 @@ router.get("/jobs", async (req: Request, res: Response) => {
 /**
  * POST /api/rider/jobs/:id/accept
  */
-router.post("/jobs/:id/accept", requireWalletEligibleRider, async (req: Request, res: Response) => {
+router.post("/jobs/:id/accept", requireVerifiedRider, requireWalletEligibleRider, async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
   const rideId = req.params.id;
 
   try {
-    await db.query("BEGIN");
-    const ride = await db.query("SELECT * FROM ride_bookings WHERE id = $1 FOR UPDATE", [rideId]);
-    if (ride.length === 0 || ride[0].status !== "requested") {
-      await db.query("ROLLBACK");
-      return sendError(res, "INVALID_JOB", "Job is no longer available.");
-    }
+    let acceptedRide: any;
+    await db.transaction(async (client) => {
+      const eligibility = await client.query(
+        `SELECT is_online, verification_status, vehicle_type
+         FROM rider_profiles WHERE user_id = $1 FOR UPDATE`,
+        [authReq.user!.id]
+      );
+      if (eligibility.rows.length === 0 || eligibility.rows[0].verification_status !== "verified" || !eligibility.rows[0].is_online) {
+        throw new Error("RIDER_NOT_ELIGIBLE");
+      }
+      const rideResult = await client.query("SELECT * FROM ride_bookings WHERE id = $1 FOR UPDATE", [rideId]);
+      const ride = rideResult.rows[0];
+      const vehicleType = eligibility.rows[0].vehicle_type;
+      const serviceMatches = ride && (ride.service_type === vehicleType || (vehicleType === "car" && String(ride.service_type).startsWith("car_")));
+      if (!ride || ride.status !== "requested" || ride.rider_id || !serviceMatches) throw new Error("JOB_UNAVAILABLE");
 
-    await db.query(
-      "UPDATE ride_bookings SET status = 'accepted', rider_id = $1, updated_at = NOW() WHERE id = $2",
+      const updated = await client.query(
+        `UPDATE ride_bookings SET
+         status = 'accepted', rider_id = $1,
+         accepted_fare = COALESCE(customer_offer_fare, fare, system_estimated_fare, total_fare),
+         fare = COALESCE(customer_offer_fare, fare, system_estimated_fare, total_fare),
+         total_fare = COALESCE(customer_offer_fare, fare, system_estimated_fare, total_fare),
+         negotiation_status = 'accepted', accepted_at = NOW(), updated_at = NOW()
+       WHERE id = $2 AND status = 'requested' AND rider_id IS NULL
+       RETURNING *`,
       [authReq.user!.id, rideId]
-    );
-    await db.query("COMMIT");
+      );
+      if (updated.rows.length !== 1) throw new Error("JOB_UNAVAILABLE");
+      acceptedRide = updated.rows[0];
+    });
 
     io.to(rideId).emit("ride_update", { rideId, status: "accepted" });
 
-    const customer = await db.query("SELECT phone FROM users WHERE id = $1", [ride[0].customer_id]);
-    const rider = await db.query("SELECT u.full_name, rv.registration_number AS vehicle_number, rv.make_model AS vehicle_model FROM users u LEFT JOIN rider_vehicles rv ON u.id = rv.rider_id WHERE u.id = $1", [authReq.user!.id]);
+    const customer = await db.query("SELECT phone FROM users WHERE id = $1", [acceptedRide.customer_id]);
+    const rider = await db.query(
+      `SELECT u.full_name, rv.registration_number AS vehicle_number, rv.make_model AS vehicle_model
+       FROM users u
+       LEFT JOIN rider_profiles rp ON rp.user_id = u.id
+       LEFT JOIN rider_vehicles rv ON rv.rider_id = rp.id
+       WHERE u.id = $1 LIMIT 1`,
+      [authReq.user!.id]
+    );
 
     if (customer.length > 0 && rider.length > 0) {
       await domainNotifier.dispatch(customer[0].phone, "rider_assigned", {
@@ -390,9 +439,11 @@ router.post("/jobs/:id/accept", requireWalletEligibleRider, async (req: Request,
       });
     }
 
-    return sendSuccess(res, { message: "Job accepted successfully." });
+    return sendSuccess(res, { message: "Job accepted successfully.", ride: acceptedRide });
   } catch (error: any) {
-    await db.query("ROLLBACK");
+    if (["JOB_UNAVAILABLE", "RIDER_NOT_ELIGIBLE"].includes(error.message)) {
+      return sendError(res, "INVALID_JOB", "This job is no longer available for your vehicle or account.", 409);
+    }
     return sendError(res, "ACCEPT_FAILED", error.message);
   }
 });
@@ -429,6 +480,21 @@ router.post("/jobs/:id/arrived", async (req: Request, res: Response) => {
   }
 });
 
+/** Verify the customer's private pickup PIN before the trip can begin. */
+router.post("/jobs/:id/verify-pickup", async (req: Request, res: Response) => {
+  const authReq = req as AuthenticatedRequest;
+  const pin = String(req.body?.pin || "").trim();
+  if (!/^\d{4}$/.test(pin)) return sendError(res, "INVALID_PIN", "Enter the customer's 4-digit pickup PIN.", 400);
+  const updated = await db.query(
+    `UPDATE ride_bookings SET pickup_verified_at = NOW(), updated_at = NOW()
+     WHERE id = $1 AND rider_id = $2 AND status = 'arrived' AND pickup_pin = $3
+     RETURNING id, pickup_verified_at`,
+    [req.params.id, authReq.user!.id, pin]
+  );
+  if (updated.length === 0) return sendError(res, "INVALID_PIN", "That pickup PIN is incorrect.", 400);
+  return sendSuccess(res, { verified: true, pickup_verified_at: updated[0].pickup_verified_at });
+});
+
 /**
  * POST /api/rider/jobs/:id/start
  */
@@ -440,6 +506,7 @@ router.post("/jobs/:id/start", async (req: Request, res: Response) => {
     if (ride[0].status !== "arrived") {
       return sendError(res, "INVALID_TRANSITION", `Cannot start ride from status '${ride[0].status}'.`);
     }
+    if (!ride[0].pickup_verified_at) return sendError(res, "PICKUP_NOT_VERIFIED", "Verify the customer's pickup PIN first.", 409);
 
     await db.query("UPDATE ride_bookings SET status = 'in_transit', updated_at = NOW() WHERE id = $1", [req.params.id]);
     io.to(req.params.id).emit("ride_update", { rideId: req.params.id, status: "in_transit" });
@@ -459,27 +526,55 @@ router.post("/jobs/:id/start", async (req: Request, res: Response) => {
 router.post("/jobs/:id/complete", async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
   try {
-    const ride = await db.query("SELECT * FROM ride_bookings WHERE id = $1 AND rider_id = $2", [req.params.id, authReq.user!.id]);
-    if (ride.length === 0) return sendError(res, "INVALID_JOB", "Job not found.");
-    if (ride[0].status !== "in_transit") {
-      return sendError(res, "INVALID_TRANSITION", `Cannot complete ride from status '${ride[0].status}'.`);
-    }
-
-    await db.query("UPDATE ride_bookings SET status = 'completed', updated_at = NOW() WHERE id = $1", [req.params.id]);
+    const riderProfileId = await resolveRiderProfileId(authReq.user!.id);
+    if (!riderProfileId) return sendError(res, "PROFILE_MISSING", "Rider profile not found.", 404);
+    let completedRide: any;
+    await db.transaction(async (client) => {
+      const rideResult = await client.query(
+        "SELECT * FROM ride_bookings WHERE id = $1 AND rider_id = $2 FOR UPDATE",
+        [req.params.id, authReq.user!.id]
+      );
+      const ride = rideResult.rows[0];
+      if (!ride || ride.status !== "in_transit") throw new Error("INVALID_TRANSITION");
+      const fare = Number(ride.accepted_fare ?? ride.fare ?? ride.total_fare ?? 0);
+      const commission = Number(ride.commission_amount ?? 0);
+      const netEarning = Math.max(0, fare - commission);
+      const updated = await client.query(
+        `UPDATE ride_bookings SET status = 'completed', completed_at = NOW(), updated_at = NOW()
+         WHERE id = $1 AND status = 'in_transit' RETURNING *`,
+        [req.params.id]
+      );
+      completedRide = updated.rows[0];
+      await client.query(
+        `INSERT INTO rider_wallets (id, rider_id, balance) VALUES ($1, $2, 0)
+         ON CONFLICT (rider_id) DO NOTHING`,
+        ["wal_" + crypto.randomUUID().slice(0, 8), riderProfileId]
+      );
+      await client.query(
+        `UPDATE rider_wallets SET balance = balance + $1, updated_at = NOW() WHERE rider_id = $2`,
+        [netEarning, riderProfileId]
+      );
+      await client.query(
+        `INSERT INTO rider_wallet_ledger (id, rider_id, amount, transaction_type, reference_id, note)
+         VALUES ($1, $2, $3, 'trip_earnings', $4, $5)`,
+        ["ledg_" + crypto.randomUUID().slice(0, 8), riderProfileId, netEarning, req.params.id, `Trip earnings after PKR ${commission.toFixed(2)} platform commission.`]
+      );
+    });
     io.to(req.params.id).emit("ride_update", { rideId: req.params.id, status: "completed" });
 
     // Ledger deduction is handled by the financial processor or legacy routes,
     // but we notify the customer immediately
-    const customer = await db.query("SELECT phone FROM users WHERE id = $1", [ride[0].customer_id]);
+    const customer = await db.query("SELECT phone FROM users WHERE id = $1", [completedRide.customer_id]);
     if (customer.length > 0) {
       await domainNotifier.dispatch(customer[0].phone, "ride_completed", {
-        fare: ride[0].fare,
+        fare: completedRide.accepted_fare ?? completedRide.fare,
         currency: 'PKR'
       });
     }
 
-    return sendSuccess(res, { message: "Ride completed successfully." });
+    return sendSuccess(res, { message: "Ride completed successfully.", ride: completedRide });
   } catch (error: any) {
+    if (error.message === "INVALID_TRANSITION") return sendError(res, "INVALID_TRANSITION", "Only an in-progress trip can be completed.", 409);
     return sendError(res, "UPDATE_FAILED", error.message);
   }
 });

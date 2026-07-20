@@ -1,4 +1,4 @@
-import { db } from './db/index';
+import { db } from '../../db/index';
 
 const API_URL = 'http://localhost:3000';
 
@@ -33,6 +33,11 @@ async function run() {
     res = await apiFetch('/api/auth/signup-password', 'POST', { phone: riderPhone, username: `e2e_rider_${Date.now()}`, password, role: 'rider', full_name: 'E2E Rider' });
     console.log('[Rider Signup]', res.status);
 
+    // The production journey verifies these accounts through OTP. This E2E
+    // fixture marks only its isolated users verified so it can test the ride
+    // lifecycle without reading or bypassing a real OTP.
+    await db.query("UPDATE users SET is_verified = true WHERE phone IN ($1, $2)", [customerPhone.replace('+', ''), riderPhone.replace('+', '')]);
+
     res = await apiFetch('/api/auth/login-password', 'POST', { phone: customerPhone, password });
     customerToken = res.data?.data?.token || res.data?.token;
     customerId = res.data?.data?.user?.id || res.data?.user?.id;
@@ -45,6 +50,12 @@ async function run() {
     // Rider needs a rider_profiles row to receive a rating lookup during offer-fare.
     const riderProfileCheck = await db.query('SELECT id FROM rider_profiles WHERE user_id = $1', [riderId]);
     console.log('[Rider profile auto-created on signup]', riderProfileCheck.length > 0);
+    await db.query(
+      `UPDATE rider_profiles SET verification_status = 'verified', is_online = true,
+         vehicle_type = 'rickshaw', current_lat = 24.86, current_lng = 67.00,
+         last_location_at = NOW(), updated_at = NOW() WHERE user_id = $1`,
+      [riderId]
+    );
 
     console.log('\n[1] GET /api/rides/types');
     res = await apiFetch('/api/rides/types', 'GET', undefined, customerToken);
@@ -102,10 +113,37 @@ async function run() {
     if (finalRow[0].rider_id !== riderId) throw new Error('rider_id not assigned correctly');
     if (Number(finalRow[0].accepted_fare) !== 420) throw new Error('accepted_fare mismatch');
 
+    console.log('\n[6] Rider pickup lifecycle: arrived -> PIN verified -> in transit -> completed');
+    res = await apiFetch(`/api/rider/jobs/${rideId}/arrived`, 'POST', undefined, riderToken);
+    if (!res.ok) throw new Error('arrived failed: ' + JSON.stringify(res.data));
+    const pinRows = await db.query('SELECT pickup_pin FROM ride_bookings WHERE id = $1', [rideId]);
+    if (!/^\d{4}$/.test(pinRows[0]?.pickup_pin || '')) throw new Error('pickup PIN missing or invalid');
+    res = await apiFetch(`/api/rider/jobs/${rideId}/verify-pickup`, 'POST', { pin: pinRows[0].pickup_pin }, riderToken);
+    if (!res.ok) throw new Error('pickup verification failed: ' + JSON.stringify(res.data));
+    res = await apiFetch(`/api/rider/jobs/${rideId}/start`, 'POST', undefined, riderToken);
+    if (!res.ok) throw new Error('start failed: ' + JSON.stringify(res.data));
+    res = await apiFetch(`/api/rider/jobs/${rideId}/complete`, 'POST', undefined, riderToken);
+    if (!res.ok) throw new Error('complete failed: ' + JSON.stringify(res.data));
+
+    const completed = await db.query('SELECT status, pickup_verified_at, accepted_fare FROM ride_bookings WHERE id = $1', [rideId]);
+    if (completed[0].status !== 'completed' || !completed[0].pickup_verified_at) throw new Error('completed ride state mismatch');
+    const ledger = await db.query(
+      `SELECT l.amount, l.transaction_type FROM rider_wallet_ledger l
+       JOIN rider_profiles rp ON rp.id = l.rider_id
+       WHERE rp.user_id = $1 AND l.reference_id = $2`,
+      [riderId, rideId]
+    );
+    if (ledger.length !== 1 || ledger[0].transaction_type !== 'trip_earnings') throw new Error('rider earnings ledger mismatch');
+
+    console.log('\n[7] Customer can fetch the completed receipt contract');
+    res = await apiFetch(`/api/rides/${rideId}`, 'GET', undefined, customerToken);
+    if (!res.ok || res.data?.data?.status !== 'completed') throw new Error('customer completed receipt fetch failed');
+
     console.log('\n--- ALL ASSERTIONS PASSED ---');
   } finally {
     console.log('\n--- CLEANUP ---');
     if (rideId) {
+      await db.query('DELETE FROM rider_wallet_ledger WHERE reference_id = $1', [rideId]);
       await db.query('DELETE FROM ride_offers WHERE ride_id = $1', [rideId]);
       await db.query('DELETE FROM ride_status_logs WHERE ride_id = $1', [rideId]);
       await db.query('DELETE FROM ride_bookings WHERE id = $1', [rideId]);
@@ -120,7 +158,6 @@ async function run() {
       await db.query('DELETE FROM users WHERE id = $1', [customerId]);
     }
     console.log('Cleaned up test rows.');
-    process.exit(0);
   }
 }
 

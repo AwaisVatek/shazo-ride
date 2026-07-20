@@ -101,6 +101,74 @@ router.patch("/me", async (req: Request, res: Response) => {
   }
 });
 
+// --- SAVED PLACES ---
+router.get("/saved-places", async (req: Request, res: Response) => {
+  const authReq = req as AuthenticatedRequest;
+  try {
+    const places = await db.query(
+      `SELECT id, label, address, latitude, longitude, place_type, created_at, updated_at
+       FROM customer_saved_places
+       WHERE customer_id = $1
+       ORDER BY CASE place_type WHEN 'home' THEN 0 WHEN 'work' THEN 1 ELSE 2 END, updated_at DESC`,
+      [authReq.user!.id]
+    );
+    return sendSuccess(res, { places });
+  } catch (error: any) {
+    return sendError(res, "FETCH_SAVED_PLACES_FAILED", error.message, 500);
+  }
+});
+
+router.post("/saved-places", async (req: Request, res: Response) => {
+  const authReq = req as AuthenticatedRequest;
+  const { label, address, latitude, longitude, place_type } = req.body;
+  const normalizedLabel = typeof label === "string" ? label.trim() : "";
+  const normalizedAddress = typeof address === "string" ? address.trim() : "";
+  const lat = Number(latitude);
+  const lng = Number(longitude);
+  const allowedTypes = ["home", "work", "other"];
+  const normalizedType = allowedTypes.includes(place_type) ? place_type : "other";
+
+  if (!normalizedLabel || !normalizedAddress || !Number.isFinite(lat) || !Number.isFinite(lng)) {
+    return sendError(res, "VALIDATION_FAILED", "Label, address, latitude and longitude are required.", 400);
+  }
+  if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+    return sendError(res, "VALIDATION_FAILED", "Saved-place coordinates are outside the valid range.", 400);
+  }
+
+  try {
+    const id = "place_" + crypto.randomUUID().replaceAll("-", "");
+    const places = await db.query(
+      `INSERT INTO customer_saved_places (id, customer_id, label, address, latitude, longitude, place_type)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)
+       ON CONFLICT (customer_id, label) DO UPDATE SET
+         address = EXCLUDED.address,
+         latitude = EXCLUDED.latitude,
+         longitude = EXCLUDED.longitude,
+         place_type = EXCLUDED.place_type,
+         updated_at = NOW()
+       RETURNING id, label, address, latitude, longitude, place_type, created_at, updated_at`,
+      [id, authReq.user!.id, normalizedLabel, normalizedAddress, lat, lng, normalizedType]
+    );
+    return sendSuccess(res, { place: places[0] }, 201);
+  } catch (error: any) {
+    return sendError(res, "SAVE_PLACE_FAILED", error.message, 500);
+  }
+});
+
+router.delete("/saved-places/:id", async (req: Request, res: Response) => {
+  const authReq = req as AuthenticatedRequest;
+  try {
+    const removed = await db.query(
+      "DELETE FROM customer_saved_places WHERE id = $1 AND customer_id = $2 RETURNING id",
+      [req.params.id, authReq.user!.id]
+    );
+    if (removed.length === 0) return sendError(res, "NOT_FOUND", "Saved place not found.", 404);
+    return sendSuccess(res, { id: removed[0].id, message: "Saved place removed." });
+  } catch (error: any) {
+    return sendError(res, "DELETE_SAVED_PLACE_FAILED", error.message, 500);
+  }
+});
+
 // --- RIDES ---
 /**
  * GET /api/customer/rides

@@ -15,7 +15,13 @@ const router = Router();
  */
 router.get("/types", requireAuth, async (req: Request, res: Response) => {
   try {
-    const types = await db.query("SELECT * FROM service_settings WHERE is_active = true");
+    const types = await db.query(
+      `SELECT * FROM service_settings
+       WHERE is_active = true
+         AND service_type = ANY($1::text[])
+       ORDER BY array_position($1::text[], service_type)`,
+      [["bike", "rickshaw", "car_mini", "car_go", "car_business", "car_luxury"]]
+    );
     return sendSuccess(res, { types });
   } catch (err: any) {
     return sendError(res, "FETCH_TYPES_FAILED", err.message, 500);
@@ -84,7 +90,12 @@ router.post("/estimate", requireAuth, async (req: Request, res: Response) => {
     }
 
     // 2. Fetch service fare configuration rules from SQL
-    const activeSettings = await db.query("SELECT * FROM service_settings WHERE is_active = true");
+    const activeSettings = await db.query(
+      `SELECT * FROM service_settings
+       WHERE is_active = true
+         AND service_type = ANY($1::text[])`,
+      [["bike", "rickshaw", "car_mini", "car_go", "car_business", "car_luxury"]]
+    );
 
     if (activeSettings.length === 0) {
       return sendError(res, "CONFIG_MISSING", "Services configurations are uninitialized in the database settings.");
@@ -129,11 +140,14 @@ router.post("/estimate", requireAuth, async (req: Request, res: Response) => {
       const finalMinimumFare = Math.max(0, minimumFare - calcDiscount(minimumFare));
       const finalRecommendedFare = Math.max(0, recommendedFare - calcDiscount(recommendedFare));
       
+      const maximumMultiplier = Number(service.maximum_fare_multiplier) || 1.5;
+      const finalMaximumFare = Math.max(finalRecommendedFare, finalRecommendedFare * maximumMultiplier);
       return {
         service_type: service.service_type,
         service_name: service.service_name || service.service_type,
         minimum_fare: Math.round(finalMinimumFare),
         recommended_fare: Math.round(finalRecommendedFare),
+        maximum_fare: Math.round(finalMaximumFare),
         total_fare: Math.round(finalRecommendedFare), // Legacy compat
         discount_applied: Math.round(calcDiscount(recommendedFare)),
         currency: config.DEFAULT_CURRENCY,
@@ -233,6 +247,7 @@ router.post("/request", requireAuth, async (req: AuthenticatedRequest, res: Resp
     let fare = proposed_fare ? Number(proposed_fare) : 150;
     let estimatedFare = fare;
     let min_fare = 0;
+    let max_fare = Number.MAX_SAFE_INTEGER;
 
     let estResponse: any = null;
     try {
@@ -254,6 +269,7 @@ router.post("/request", requireAuth, async (req: AuthenticatedRequest, res: Resp
         const match = estJson.data.estimates.find((e: any) => e.service_type === ride_type);
         if (match) {
           min_fare = match.minimum_fare;
+          max_fare = match.maximum_fare;
           estimatedFare = match.recommended_fare;
           if (!proposed_fare) fare = match.recommended_fare;
         }
@@ -263,6 +279,9 @@ router.post("/request", requireAuth, async (req: AuthenticatedRequest, res: Resp
     if (fare < min_fare) {
       return sendError(res, "FARE_TOO_LOW", `The minimum allowed fare for this route is ${config.DEFAULT_CURRENCY} ${min_fare}.`, 400);
     }
+    if (fare > max_fare) {
+      return sendError(res, "FARE_TOO_HIGH", `The maximum allowed fare for this route is ${config.DEFAULT_CURRENCY} ${max_fare}.`, 400);
+    }
 
     // Determine platform commission (Honor Pakistan pilot 0% Commission campaign checks)
     const setRows = await db.query("SELECT * FROM service_settings WHERE service_type = $1", [ride_type]);
@@ -271,10 +290,11 @@ router.post("/request", requireAuth, async (req: AuthenticatedRequest, res: Resp
 
     // 4. Save to Database
     const rideId = "rid_" + crypto.randomUUID().slice(0, 8);
+    const pickupPin = String(crypto.randomInt(1000, 10000));
     await db.query(
-      `INSERT INTO ride_bookings (id, customer_id, pickup_address, pickup_lat, pickup_lng, dropoff_address, dropoff_lat, dropoff_lng, distance_km, duration_minutes, service_type, vehicle_category, fare, system_estimated_fare, customer_offer_fare, minimum_fare, commission_amount, payment_method, promo_code_used, negotiation_status, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, 'pending', 'requested')`,
-      [rideId, req.user!.id, pickup_address, pickup_lat, pickup_lng, dropoff_address, dropoff_lat, dropoff_lng, distance_km, duration_minutes, ride_type, ride_type, fare, estimatedFare, proposed_fare ? fare : null, min_fare, commission, payment_method || "cash", promo_code || null]
+      `INSERT INTO ride_bookings (id, customer_id, pickup_address, pickup_lat, pickup_lng, dropoff_address, dropoff_lat, dropoff_lng, distance_km, duration_minutes, service_type, vehicle_category, fare, total_fare, system_estimated_fare, customer_offer_fare, minimum_fare, maximum_fare, commission_amount, payment_method, promo_code_used, pickup_pin, negotiation_status, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13, $14, $15, $16, $17, $18, $19, $20, $21, 'pending', 'requested')`,
+      [rideId, req.user!.id, pickup_address, pickup_lat, pickup_lng, dropoff_address, dropoff_lat, dropoff_lng, distance_km, duration_minutes, ride_type, ride_type, fare, estimatedFare, proposed_fare ? fare : null, min_fare, max_fare, commission, payment_method || "cash", promo_code || null, pickupPin]
     );
 
     // Initial status logs trail
@@ -286,8 +306,11 @@ router.post("/request", requireAuth, async (req: AuthenticatedRequest, res: Resp
 
     const fullBooking = await db.query("SELECT * FROM ride_bookings WHERE id = $1", [rideId]);
 
-    // Broadcast new ride to all drivers
-    io.to("driver_pool").emit("new_ride_request", fullBooking[0]);
+    // Dispatch only the public request fields. The pickup PIN and customer
+    // contact details are never broadcast before a rider is assigned.
+    const { pickup_pin: _pickupPin, customer_id: _customerId, ...dispatchRide } = fullBooking[0];
+    const dispatchCategory = ride_type.startsWith("car_") ? "car" : ride_type;
+    io.to(`driver_pool:${dispatchCategory}`).emit("new_ride_request", dispatchRide);
 
     return sendSuccess(res, { ride: fullBooking[0] }, 201);
 
@@ -307,26 +330,49 @@ router.post("/offer-fare", requireAuth, async (req: AuthenticatedRequest, res: R
   }
 
   try {
-    const rides = await db.query("SELECT status, minimum_fare FROM ride_bookings WHERE id = $1", [ride_id]);
+    if (req.user!.role !== "rider") {
+      return sendError(res, "FORBIDDEN", "Only riders can submit a fare offer.", 403);
+    }
+    const rides = await db.query("SELECT status, rider_id, service_type, pickup_lat, pickup_lng, minimum_fare, maximum_fare FROM ride_bookings WHERE id = $1", [ride_id]);
     if (rides.length === 0) {
       return sendError(res, "RIDE_NOT_FOUND", "No ride matches this transaction.", 404);
     }
 
-    if (rides[0].status !== "requested") {
+    if (rides[0].status !== "requested" || rides[0].rider_id) {
       return sendError(res, "INVALID_STATE", "Bidding operations are only active on unassigned pending ride requests.", 400);
+    }
+
+    const profiles = await db.query(
+      `SELECT verification_status, is_online, vehicle_type, current_lat, current_lng, last_location_at
+       FROM rider_profiles WHERE user_id = $1`,
+      [req.user!.id]
+    );
+    const profile = profiles[0];
+    const serviceMatches = profile && (profile.vehicle_type === rides[0].service_type || (profile.vehicle_type === "car" && String(rides[0].service_type).startsWith("car_")));
+    const locationFresh = profile?.last_location_at && Date.now() - new Date(profile.last_location_at).getTime() < 10 * 60 * 1000;
+    const toRadians = (value: number) => value * Math.PI / 180;
+    const lat1 = Number(profile?.current_lat); const lng1 = Number(profile?.current_lng);
+    const lat2 = Number(rides[0].pickup_lat); const lng2 = Number(rides[0].pickup_lng);
+    const dLat = toRadians(lat2 - lat1); const dLng = toRadians(lng2 - lng1);
+    const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRadians(lat1)) * Math.cos(toRadians(lat2)) * Math.sin(dLng / 2) ** 2;
+    const pickupDistanceKm = 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    if (!profile || profile.verification_status !== "verified" || !profile.is_online || !serviceMatches || !locationFresh || profile.current_lat == null || profile.current_lng == null || !Number.isFinite(pickupDistanceKm) || pickupDistanceKm > 15) {
+      return sendError(res, "RIDER_NOT_ELIGIBLE", "Go online with a current location and matching verified vehicle before making an offer.", 403);
     }
 
     if (Number(proposed_fare) < Number(rides[0].minimum_fare)) {
       return sendError(res, "FARE_TOO_LOW", `The minimum allowed fare for this route is ${config.DEFAULT_CURRENCY} ${rides[0].minimum_fare}.`, 400);
     }
+    if (rides[0].maximum_fare != null && Number(proposed_fare) > Number(rides[0].maximum_fare)) {
+      return sendError(res, "FARE_TOO_HIGH", `The maximum allowed fare for this route is ${config.DEFAULT_CURRENCY} ${rides[0].maximum_fare}.`, 400);
+    }
 
     // Save bid offer row
     const offerId = "off_" + crypto.randomUUID().slice(0, 8);
-    const isCounter = req.user!.role === "customer";
     await db.query(
       `INSERT INTO ride_offers (id, ride_id, by_role, offerer_id, proposed_fare, status, is_counter_offer)
        VALUES ($1, $2, $3, $4, $5, 'pending', $6)`,
-      [offerId, ride_id, req.user!.role, req.user!.id, proposed_fare, isCounter]
+      [offerId, ride_id, "rider", req.user!.id, proposed_fare, true]
     );
 
     // Reflect the latest counter directly on the ride row too, so anything
@@ -338,14 +384,28 @@ router.post("/offer-fare", requireAuth, async (req: AuthenticatedRequest, res: R
 
     // Alert the customer that a driver proposed a bid — real aggregate
     // rating from rider_profiles, not a placeholder.
-    const riderProfile = await db.query("SELECT rating FROM rider_profiles WHERE user_id = $1", [req.user!.id]);
+    const riderProfile = await db.query(
+      `SELECT rp.rating, rp.total_rides, rv.make_model, rv.color,
+              COALESCE(rv.license_plate, rv.registration_number) AS license_plate
+       FROM rider_profiles rp
+       LEFT JOIN rider_vehicles rv ON rv.rider_id = rp.id
+       WHERE rp.user_id = $1
+       ORDER BY rv.created_at DESC NULLS LAST
+       LIMIT 1`,
+      [req.user!.id]
+    );
+    const rider = riderProfile[0] || {};
     io.to(ride_id).emit("new_driver_offer", {
-      offerId,
+      id: offerId,
       proposed_fare,
       driver: {
         id: req.user!.id,
         name: req.user!.full_name,
-        rating: riderProfile.length > 0 && riderProfile[0].rating != null ? Number(riderProfile[0].rating) : null
+        rating: rider.rating != null ? Number(rider.rating) : null,
+        total_rides: Number(rider.total_rides || 0),
+        make_model: rider.make_model || null,
+        color: rider.color || null,
+        license_plate: rider.license_plate || null
       }
     });
 
@@ -371,32 +431,42 @@ router.post("/:id/accept-offer", requireAuth, async (req: AuthenticatedRequest, 
   }
 
   try {
-    const rides = await db.query("SELECT * FROM ride_bookings WHERE id = $1 AND customer_id = $2", [rideId, req.user!.id]);
-    if (rides.length === 0) {
-      return sendError(res, "RIDE_NOT_FOUND", "No matching ride found for this customer.", 404);
-    }
-    if (rides[0].status !== "requested") {
-      return sendError(res, "INVALID_STATE", `Cannot accept an offer while the ride is '${rides[0].status}'.`, 400);
-    }
-
-    const offers = await db.query("SELECT * FROM ride_offers WHERE id = $1 AND ride_id = $2 AND status = 'pending'", [offer_id, rideId]);
-    if (offers.length === 0) {
-      return sendError(res, "OFFER_NOT_FOUND", "This offer is no longer available.", 404);
-    }
-    const offer = offers[0];
-
+    let acceptedRide: any;
     await db.transaction(async (client) => {
-      await client.query(
+      const rideResult = await client.query(
+        "SELECT * FROM ride_bookings WHERE id = $1 AND customer_id = $2 FOR UPDATE",
+        [rideId, req.user!.id]
+      );
+      const ride = rideResult.rows[0];
+      if (!ride) throw new Error("RIDE_NOT_FOUND");
+      if (ride.status !== "requested" || ride.rider_id) throw new Error("RIDE_UNAVAILABLE");
+
+      const offerResult = await client.query(
+        `SELECT ro.* FROM ride_offers ro
+         JOIN rider_profiles rp ON rp.user_id = ro.offerer_id
+         WHERE ro.id = $1 AND ro.ride_id = $2 AND ro.status = 'pending'
+           AND ro.by_role = 'rider' AND rp.verification_status = 'verified'
+         FOR UPDATE OF ro`,
+        [offer_id, rideId]
+      );
+      const offer = offerResult.rows[0];
+      if (!offer) throw new Error("OFFER_NOT_FOUND");
+
+      const updated = await client.query(
         `UPDATE ride_bookings SET
            status = 'accepted',
            rider_id = $1,
            accepted_fare = $2,
            fare = $2,
+           total_fare = $2,
            negotiation_status = 'accepted',
-           updated_at = NOW()
-         WHERE id = $3`,
+           accepted_at = NOW(), updated_at = NOW()
+         WHERE id = $3 AND status = 'requested' AND rider_id IS NULL
+         RETURNING *`,
         [offer.offerer_id, offer.proposed_fare, rideId]
       );
+      if (updated.rows.length !== 1) throw new Error("RIDE_UNAVAILABLE");
+      acceptedRide = updated.rows[0];
       await client.query("UPDATE ride_offers SET status = 'accepted' WHERE id = $1", [offer_id]);
       // Any other rider's pending bid on this ride is now moot.
       await client.query(
@@ -407,8 +477,11 @@ router.post("/:id/accept-offer", requireAuth, async (req: AuthenticatedRequest, 
 
     io.to(rideId).emit("ride_update", { rideId, status: "accepted" });
 
-    return sendSuccess(res, { message: "Offer accepted. A rider has been assigned to this ride." });
+    return sendSuccess(res, { message: "Offer accepted. A rider has been assigned to this ride.", ride: acceptedRide });
   } catch (err: any) {
+    if (err.message === "RIDE_NOT_FOUND") return sendError(res, "RIDE_NOT_FOUND", "No matching ride found for this customer.", 404);
+    if (err.message === "OFFER_NOT_FOUND") return sendError(res, "OFFER_NOT_FOUND", "This offer is no longer available.", 404);
+    if (err.message === "RIDE_UNAVAILABLE") return sendError(res, "INVALID_STATE", "This ride has already been assigned or is no longer requestable.", 409);
     return sendError(res, "ACCEPT_OFFER_FAILED", err.message, 500);
   }
 });
@@ -744,13 +817,37 @@ router.get("/:id", requireAuth, async (req: Request, res: Response) => {
       if (drivers.length > 0) {
         ride.driver = drivers[0];
         // Fetch vehicle
-        const vehicles = await db.query("SELECT * FROM rider_vehicles WHERE rider_id = $1", [ride.rider_id]);
+        const vehicles = await db.query(
+          `SELECT rv.* FROM rider_vehicles rv
+           JOIN rider_profiles rp ON rp.id = rv.rider_id
+           WHERE rp.user_id = $1
+           ORDER BY rv.created_at DESC LIMIT 1`,
+          [ride.rider_id]
+        );
         if (vehicles.length > 0) {
           ride.driver.vehicle_number = vehicles[0].license_plate || vehicles[0].registration_number;
           ride.vehicle_info = vehicles[0];
         }
       }
     }
+
+    if (ride.customer_id === authReq.user!.id && ride.status === "requested") {
+      ride.offers = await db.query(
+        `SELECT ro.id, ro.proposed_fare, ro.status, ro.created_at,
+                u.id AS driver_id, u.full_name AS driver_name,
+                rp.rating AS driver_rating, rp.total_rides,
+                rv.make_model, rv.license_plate, rv.registration_number, rv.color
+           FROM ride_offers ro
+           JOIN users u ON u.id = ro.offerer_id
+           LEFT JOIN rider_profiles rp ON rp.user_id = u.id
+           LEFT JOIN rider_vehicles rv ON rv.rider_id = rp.id
+          WHERE ro.ride_id = $1 AND ro.status = 'pending'
+          ORDER BY ro.created_at ASC`,
+        [ride.id]
+      );
+    }
+
+    ride.display_fare = Number(ride.accepted_fare ?? ride.fare ?? ride.customer_offer_fare ?? ride.system_estimated_fare ?? ride.total_fare ?? 0);
     
     return sendSuccess(res, ride);
   } catch (err: any) {

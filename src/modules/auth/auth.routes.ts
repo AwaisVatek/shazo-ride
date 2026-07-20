@@ -44,7 +44,9 @@ router.post("/otp/send", async (req: Request, res: Response) => {
     }
 
     // 2. Generate cryptographically safe PIN code
-    const rawPin = Math.floor(1000 + Math.random() * 9000).toString(); // 4 digit code
+    const otpMin = 10 ** (config.OTP_CODE_LENGTH - 1);
+    const otpMax = 10 ** config.OTP_CODE_LENGTH;
+    const rawPin = crypto.randomInt(otpMin, otpMax).toString();
     const salt = await bcrypt.genSalt(10);
     const pinHash = await bcrypt.hash(rawPin, salt);
     const lifeMinutes = config.OTP_EXPIRY_MINUTES;
@@ -383,7 +385,7 @@ router.post("/request-otp", async (req: Request, res: Response) => {
     if (isTestCustomer) {
       rawPin = config.CUSTOMER_TEST_OTP || "123456";
     } else if (!config.OTP_BYPASS_ENABLED) {
-      rawPin = Math.floor(Math.pow(10, config.OTP_CODE_LENGTH - 1) + Math.random() * 9 * Math.pow(10, config.OTP_CODE_LENGTH - 1)).toString();
+      rawPin = crypto.randomInt(10 ** (config.OTP_CODE_LENGTH - 1), 10 ** config.OTP_CODE_LENGTH).toString();
     }
 
     const salt = await bcrypt.genSalt(10);
@@ -399,7 +401,7 @@ router.post("/request-otp", async (req: Request, res: Response) => {
 
     // Send OTP
     if (!config.OTP_BYPASS_ENABLED) {
-      if (config.N8N_OTP_WEBHOOK_URL) {
+      if (config.OTP_PROVIDER === "n8n_webhook" && config.N8N_OTP_WEBHOOK_URL) {
         try {
           console.log(`[OTP_DISPATCH] Webhook URL: ${config.N8N_OTP_WEBHOOK_URL}`);
           console.log(`[OTP_DISPATCH] Target Phone: ${target}`);
@@ -423,6 +425,7 @@ router.post("/request-otp", async (req: Request, res: Response) => {
             port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
             path: urlObj.pathname + urlObj.search,
             method: 'POST',
+            timeout: 8000,
             headers: {
               'Content-Type': 'application/json',
               'Content-Length': Buffer.byteLength(postData),
@@ -443,6 +446,7 @@ router.post("/request-otp", async (req: Request, res: Response) => {
               });
             });
             req.on('error', (e: any) => reject(e));
+            req.on('timeout', () => req.destroy(new Error('OTP webhook timed out after 8 seconds')));
             req.write(postData);
             req.end();
           });
@@ -554,6 +558,8 @@ router.post("/verify-otp", async (req: Request, res: Response) => {
       activeUser = userRows[0];
     }
 
+    await db.query("UPDATE users SET is_verified = true, updated_at = NOW() WHERE id = $1", [activeUser.id]);
+
     const token = jwt.sign(
       { userId: activeUser.id, role: activeUser.role },
       config.JWT_SECRET,
@@ -642,7 +648,7 @@ router.post("/signup-password", async (req: Request, res: Response) => {
 
     console.log("[SIGNUP] Inserting user");
     console.log("[SIGNUP] Preparing OTP payload");
-    const rawPin = Math.floor(Math.pow(10, config.OTP_CODE_LENGTH - 1) + Math.random() * 9 * Math.pow(10, config.OTP_CODE_LENGTH - 1)).toString();
+    const rawPin = crypto.randomInt(10 ** (config.OTP_CODE_LENGTH - 1), 10 ** config.OTP_CODE_LENGTH).toString();
     const pinHash = await bcrypt.hash(rawPin, 10);
     const expiresAt = new Date(Date.now() + config.OTP_EXPIRY_MINUTES * 60000);
     const otpId = "vfn_" + crypto.randomUUID().slice(0, 8);
@@ -698,8 +704,9 @@ router.post("/signup-password", async (req: Request, res: Response) => {
       );
     });
 
+    let otpDeliveryPending = false;
     if (!config.OTP_BYPASS_ENABLED) {
-      if (config.N8N_OTP_WEBHOOK_URL) {
+      if (config.OTP_PROVIDER === "n8n_webhook" && config.N8N_OTP_WEBHOOK_URL) {
         try {
           console.log(`[OTP_DISPATCH_SIGNUP] Webhook URL: ${config.N8N_OTP_WEBHOOK_URL}`);
           console.log(`[OTP_DISPATCH_SIGNUP] Target Phone: ${target}`);
@@ -723,6 +730,7 @@ router.post("/signup-password", async (req: Request, res: Response) => {
             port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
             path: urlObj.pathname + urlObj.search,
             method: 'POST',
+            timeout: 8000,
             headers: {
               'Content-Type': 'application/json',
               'Content-Length': Buffer.byteLength(postData),
@@ -743,6 +751,7 @@ router.post("/signup-password", async (req: Request, res: Response) => {
               });
             });
             req.on('error', (e: any) => reject(e));
+            req.on('timeout', () => req.destroy(new Error('OTP webhook timed out after 8 seconds')));
             req.write(postData);
             req.end();
           });
@@ -750,38 +759,22 @@ router.post("/signup-password", async (req: Request, res: Response) => {
           console.log("[OTP_DISPATCH_SIGNUP] Webhook SUCCESS:", webhookResult);
         } catch (e: any) {
           console.error("[N8N_WEBHOOK_ERROR]", e.message);
-          return sendError(res, "OTP_DISPATCH_FAILED", `OTP Webhook Error: ${e.message}`, 500);
+          otpDeliveryPending = true;
         }
       } else {
         const dispatched = await domainNotifier.dispatch(target, "otp", { otp: rawPin });
         if (!dispatched) {
-          return sendError(res, "OTP_DISPATCH_FAILED", "OTP could not be sent on WhatsApp.", 500);
+          otpDeliveryPending = true;
         }
       }
     }
 
-    const token = jwt.sign(
-      { userId: userId, role: role },
-      config.JWT_SECRET,
-      { expiresIn: "30d" }
-    );
-
-    const sessionId = "ses_" + crypto.randomUUID().slice(0, 8);
-    await db.query(
-      `INSERT INTO sessions (id, user_id, role, token, expires_at)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [sessionId, userId, role, token, new Date(Date.now() + 30 * 24 * 3600000)]
-    );
-
     return sendSuccess(res, {
-      message: "Signup successful",
-      token,
-      user: {
-        id: userId,
-        phone: target,
-        role: role,
-        profile_completed: false
-      }
+      message: otpDeliveryPending ? "Account created. Request a new OTP if the first message does not arrive." : "Account created. Verify your phone to continue.",
+      phone: target,
+      role,
+      requiresVerification: true,
+      otpDeliveryPending
     }, 201);
 
   } catch (err: any) {
@@ -817,6 +810,9 @@ router.post("/login-password", async (req: Request, res: Response) => {
     }
 
     const matchedUser = userRows[0];
+    if (!matchedUser.is_verified) {
+      return sendError(res, "PHONE_NOT_VERIFIED", "Verify your phone number before signing in.", 403);
+    }
     if (matchedUser.password_login_enabled === false) {
       return sendError(res, "ACCOUNT_SUSPENDED", "Password login is disabled for this account.", 403);
     }
@@ -891,7 +887,7 @@ router.post("/forgot-password/request-otp", async (req: Request, res: Response) 
   try {
     const existing = await db.query("SELECT id FROM users WHERE phone = $1", [target]);
     if (existing.length > 0) {
-      const rawPin = Math.floor(Math.pow(10, config.OTP_CODE_LENGTH - 1) + Math.random() * 9 * Math.pow(10, config.OTP_CODE_LENGTH - 1)).toString();
+      const rawPin = crypto.randomInt(10 ** (config.OTP_CODE_LENGTH - 1), 10 ** config.OTP_CODE_LENGTH).toString();
       const pinHash = await bcrypt.hash(rawPin, 10);
       const expiresAt = new Date(Date.now() + config.OTP_EXPIRY_MINUTES * 60000);
       const otpId = "vfn_" + crypto.randomUUID().slice(0, 8);
@@ -910,6 +906,7 @@ router.post("/forgot-password/request-otp", async (req: Request, res: Response) 
             console.log(`[OTP_DISPATCH_FORGOT] Target Phone: ${target}`);
 
             const response = await fetch(config.N8N_OTP_WEBHOOK_URL, {
+              signal: AbortSignal.timeout(8000),
               method: "POST",
               headers: { 
                 "Content-Type": "application/json", 

@@ -14,9 +14,15 @@ import { seed } from "./seed/index";
 const PORT = Number(process.env.PORT) || 3000;
 
 export const httpServer = createServer(app);
+const socketAllowedOrigins = [
+  "https://admin.shazoride.com",
+  "https://app.shazoride.com",
+  "http://localhost:5173",
+  "http://localhost:3000",
+];
 export const io = new Server(httpServer, {
   cors: {
-    origin: "*",
+    origin: socketAllowedOrigins,
     methods: ["GET", "POST", "PATCH"]
   }
 });
@@ -69,16 +75,37 @@ async function canAccessRide(userId: string, role: string, rideId: string): Prom
   }
 }
 
+async function canAccessAmbulance(userId: string, role: string, requestId: string): Promise<boolean> {
+  if (role === "admin" || role === "operations_manager") return true;
+  try {
+    const rows = await db.query(
+      "SELECT 1 FROM ambulance_bookings WHERE id = $1 AND (customer_id = $2 OR rider_id = $2)",
+      [requestId, userId]
+    );
+    return rows.length > 0;
+  } catch {
+    return false;
+  }
+}
+
 // Setup basic Socket.io events
 io.on("connection", (socket: AuthedSocket) => {
   const user = socket.data.user!;
   console.log(`🔌 Client connected: ${socket.id} (user=${user.id}, role=${user.role})`);
 
   // A driver joins a specific room to receive nearby requests
-  socket.on("join_driver_pool", () => {
+  socket.on("join_driver_pool", async () => {
     if (user.role !== "rider") return;
-    socket.join("driver_pool");
-    console.log(`Driver joined pool: ${socket.id}`);
+    const profiles = await db.query(
+      `SELECT verification_status, is_online, vehicle_type, current_lat, current_lng, last_location_at
+       FROM rider_profiles WHERE user_id = $1`,
+      [user.id]
+    );
+    const profile = profiles[0];
+    const locationFresh = profile?.last_location_at && Date.now() - new Date(profile.last_location_at).getTime() < 10 * 60 * 1000;
+    if (!profile || profile.verification_status !== "verified" || !profile.is_online || !locationFresh || profile.current_lat == null || profile.current_lng == null) return;
+    socket.join(`driver_pool:${profile.vehicle_type}`);
+    console.log(`Eligible driver joined ${profile.vehicle_type} pool: ${socket.id}`);
   });
 
   // A customer or rider joins their own ride's room — only if they're
@@ -92,7 +119,8 @@ io.on("connection", (socket: AuthedSocket) => {
   });
 
   // A customer joins their ambulance dispatch's room to receive status updates
-  socket.on("join_ambulance", (requestId) => {
+  socket.on("join_ambulance", async (requestId) => {
+    if (typeof requestId !== "string" || !(await canAccessAmbulance(user.id, user.role, requestId))) return;
     socket.join(`ambulance_${requestId}`);
     console.log(`Customer joined ambulance tracking: ${requestId}`);
   });

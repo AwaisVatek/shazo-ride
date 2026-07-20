@@ -1,4 +1,4 @@
-import { db } from './db/index';
+import { db } from '../../db/index';
 
 const API_URL = 'http://localhost:3000';
 

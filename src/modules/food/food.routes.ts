@@ -245,11 +245,17 @@ router.post("/order", requireAuth, async (req: AuthenticatedRequest, res: Respon
  * GET /api/food/orders/:id
  * Tracks state of particular kitchen dispatches
  */
-router.get("/orders/:id", requireAuth, async (req: Request, res: Response) => {
+router.get("/orders/:id", requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   const orderId = req.params.id;
 
   try {
-    const orders = await db.query("SELECT * FROM food_orders WHERE id = $1", [orderId]);
+    const orders = await db.query(
+      `SELECT fo.*, rp.latitude AS restaurant_lat, rp.longitude AS restaurant_lng
+         FROM food_orders fo
+         JOIN restaurant_profiles rp ON rp.id = fo.restaurant_id
+        WHERE fo.id = $1 AND fo.customer_id = $2`,
+      [orderId, req.user!.id]
+    );
     if (orders.length === 0) {
       return sendError(res, "ORDER_NOT_FOUND", "No food order matches this transaction.", 404);
     }
